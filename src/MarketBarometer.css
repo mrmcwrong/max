@@ -564,7 +564,10 @@
 .sparkline {
   width: 100%;
   max-width: 120px;
+  min-width: 80px;
   height: 36px;
+  flex-shrink: 0;
+  overflow: visible;
 }
 
 .sparkline--empty {
@@ -577,7 +580,6 @@
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
-  vector-effect: non-scaling-stroke;
 }
 
 .sparkline__line--up {
@@ -1822,6 +1824,12 @@
 .toolbar__actions button:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.toolbar__live.is-active {
+  background: rgba(52, 211, 153, 0.16);
+  border-color: rgba(52, 211, 153, 0.55);
+  color: #6ee7b7;
 }
 
 /* At-a-glance belt + touching ticker belt */

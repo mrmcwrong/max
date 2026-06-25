@@ -28,11 +28,14 @@ import {
   computeCurvePoint,
   computeIntradayQuote,
   computeQuote,
+  estDateTimeToMs,
   fetchAllHistories,
   fetchAllIntraday,
   fetchLiveHeadlines,
   formatPercentWithAmount,
   formatSignedAmount,
+  getNowEst,
+  snapshotTimeForMode,
   yahooQuoteUrl,
   type ComputedQuote,
   type SymbolHistory,
@@ -96,7 +99,7 @@ function MarketBarometer() {
   const [snapshotDate, setSnapshotDate] = useState(() => getLastCloseDate())
   const [timeMode, setTimeMode] = useState<TimeMode>('close')
   const [customTime, setCustomTime] = useState('12:00')
-  const [presentationMode, setPresentationMode] = useState(false)
+  const [liveView, setLiveView] = useState(false)
   const [view, setView] = useState<'dashboard' | 'headlines'>('dashboard')
   const [histories, setHistories] = useState<Map<string, SymbolHistory>>(new Map())
   const [intraday, setIntraday] = useState<Map<string, SymbolHistory>>(new Map())
@@ -150,11 +153,11 @@ function MarketBarometer() {
     setFeedStatus((current) => ({ ...current, market: marketStatus }))
   }, [allSymbols])
 
-  const loadNews = useCallback(async (date: string) => {
+  const loadNews = useCallback(async (date: string, time: string) => {
     setFeedStatus((current) => ({ ...current, news: 'loading' }))
 
     const customNewsPromise = newsFeedUrl ? fetchRemoteFeed(newsFeedUrl) : Promise.resolve(null)
-    const newsPromise = fetchLiveHeadlines(date)
+    const newsPromise = fetchLiveHeadlines(date, time)
 
     const [customNewsResult, newsResult] = await Promise.allSettled([customNewsPromise, newsPromise])
 
@@ -176,13 +179,27 @@ function MarketBarometer() {
     setFeedStatus((current) => ({ ...current, news: newsStatus }))
   }, [])
 
+  const enableLiveView = useCallback(async () => {
+    const now = getNowEst()
+    setSnapshotDate(now.date)
+    setTimeMode('custom')
+    setCustomTime(now.time)
+    setLiveView(true)
+    setIntradayDate(null)
+    setIntraday(new Map())
+
+    await Promise.all([loadFeeds(), loadNews(now.date, now.time)])
+  }, [loadFeeds, loadNews])
+
+  const effectiveNewsTime = snapshotTimeForMode(timeMode, customTime)
+
   useEffect(() => {
     void loadFeeds()
   }, [loadFeeds])
 
   useEffect(() => {
-    void loadNews(snapshotDate)
-  }, [loadNews, snapshotDate])
+    void loadNews(snapshotDate, effectiveNewsTime)
+  }, [loadNews, snapshotDate, effectiveNewsTime])
 
   useEffect(() => {
     if (timeMode !== 'custom' || histories.size === 0 || intradayDate === snapshotDate) {
@@ -219,9 +236,8 @@ function MarketBarometer() {
   }, [snapshotDate])
 
   const customDateTimeMs = useMemo(() => {
-    const parsed = new Date(`${snapshotDate}T${customTime || '12:00'}:00`)
-    return Number.isNaN(parsed.getTime()) ? snapshotDateMs : parsed.getTime()
-  }, [snapshotDate, customTime, snapshotDateMs])
+    return estDateTimeToMs(snapshotDate, customTime || '12:00')
+  }, [snapshotDate, customTime])
 
   const liveQuotes = useMemo(() => {
     const map = new Map<string, ComputedQuote>()
@@ -282,7 +298,9 @@ function MarketBarometer() {
           return null
         }
 
-        const { current, oneMonthAgo, oneYearAgo } = computeCurvePoint(history, snapshotDateMs)
+        const curveDateMs = timeMode === 'custom' ? customDateTimeMs : snapshotDateMs
+
+        const { current, oneMonthAgo, oneYearAgo } = computeCurvePoint(history, curveDateMs)
         if (current == null || oneMonthAgo == null || oneYearAgo == null) {
           return null
         }
@@ -290,7 +308,7 @@ function MarketBarometer() {
         return { tenor: point.tenor, symbol: point.symbol, current, oneMonthAgo, oneYearAgo }
       })
       .filter((point): point is CurvePoint => point !== null)
-  }, [histories, snapshotDateMs])
+  }, [histories, snapshotDateMs, customDateTimeMs, timeMode])
 
   const curveDomain =
     treasuryCurve.length > 0
@@ -302,12 +320,13 @@ function MarketBarometer() {
 
   const isLoading = feedStatus.market === 'loading'
 
-  const snapshotTimeLabel =
-    timeMode === 'open'
+  const snapshotTimeLabel = liveView
+    ? formatEstTimestamp(snapshotDate, customTime)
+    : timeMode === 'open'
       ? '9:30 a.m. EST (opening)'
       : timeMode === 'close'
         ? '4 p.m. EST (closing)'
-        : `${customTime} EST (custom)`
+        : `${formatEstTimestamp(snapshotDate, customTime)} (custom)`
 
   const handlePrint = useCallback(() => {
     window.print()
@@ -318,7 +337,7 @@ function MarketBarometer() {
   }
 
   return (
-    <main className={`page-shell ${presentationMode ? 'presentation-mode' : ''}`}>
+    <main className="page-shell">
       <div className="screen-view">
       <header className="hero-panel hero-panel--compact">
         <div className="hero-copy">
@@ -335,7 +354,10 @@ function MarketBarometer() {
                   key={option}
                   type="button"
                   className={`segmented__button ${timeFrame === option ? 'is-active' : ''}`}
-                  onClick={() => setTimeFrame(option)}
+                  onClick={() => {
+                    setLiveView(false)
+                    setTimeFrame(option)
+                  }}
                 >
                   {option}
                 </button>
@@ -350,7 +372,10 @@ function MarketBarometer() {
               type="date"
               value={snapshotDate}
               max={toDateInputValue(new Date())}
-              onChange={(event) => setSnapshotDate(event.target.value)}
+              onChange={(event) => {
+                setLiveView(false)
+                setSnapshotDate(event.target.value)
+              }}
             />
           </label>
 
@@ -359,7 +384,10 @@ function MarketBarometer() {
             <select
               id="snapshotTime"
               value={timeMode}
-              onChange={(event) => setTimeMode(event.target.value as TimeMode)}
+              onChange={(event) => {
+                setLiveView(false)
+                setTimeMode(event.target.value as TimeMode)
+              }}
             >
               {timeModeOptions.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -376,17 +404,23 @@ function MarketBarometer() {
                 id="customTime"
                 type="time"
                 value={customTime}
-                onChange={(event) => setCustomTime(event.target.value)}
+                onChange={(event) => {
+                  setLiveView(false)
+                  setCustomTime(event.target.value)
+                }}
               />
             </label>
           ) : null}
 
           <div className="toolbar__actions">
-            <button type="button" onClick={() => void loadFeeds()} disabled={isLoading} title="Refresh data">
-              {isLoading ? '…' : 'Refresh'}
-            </button>
-            <button type="button" onClick={() => setPresentationMode((current) => !current)}>
-              {presentationMode ? 'Exit' : 'Present'}
+            <button
+              type="button"
+              className={`toolbar__live ${liveView ? 'is-active' : ''}`}
+              onClick={() => void enableLiveView()}
+              disabled={isLoading}
+              title="Jump to latest live market data"
+            >
+              {isLoading ? '…' : 'Live'}
             </button>
             <button type="button" onClick={handlePrint}>
               Print
@@ -401,7 +435,7 @@ function MarketBarometer() {
 
       <CollapsiblePanel
         title="Top headlines"
-        subtitle="Live economic and business headlines for advisor discussion"
+        subtitle="Ranked for the snapshot date and time — Fed, earnings, macro, and trade stories that matter most right then"
         eyebrow="News"
         defaultOpen
         action={
@@ -1115,6 +1149,19 @@ function formatValue(value: number, unit: Unit) {
     default:
       return value >= 1000 ? value.toFixed(1) : value.toFixed(2)
   }
+}
+
+function formatEstTimestamp(date: string, time: string) {
+  const ms = estDateTimeToMs(date, time)
+  return new Date(ms).toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    month: 'numeric',
+    day: 'numeric',
+    year: '2-digit',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  })
 }
 
 function getLastCloseDate() {
