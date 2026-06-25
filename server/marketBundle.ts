@@ -256,5 +256,3 @@ export async function handleMarketBundle(req: IncomingMessage, res: ServerRespon
     res.end(JSON.stringify({ error: 'Market bundle failed' }))
   }
 }
-
-export type { FredHistory }
