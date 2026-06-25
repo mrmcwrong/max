@@ -124,6 +124,16 @@ function MarketBarometer() {
     [],
   )
 
+  const orderedSymbols = useMemo(() => {
+    const priority = new Set([
+      ...Object.values(summarySymbols),
+      ...treasuryCurveSymbols.map((point) => point.symbol),
+    ])
+    const preferred = allSymbols.filter((symbol) => priority.has(symbol))
+    const remainder = allSymbols.filter((symbol) => !priority.has(symbol))
+    return [...preferred, ...remainder]
+  }, [allSymbols])
+
   const intradaySymbolList = useMemo(
     () => [
       ...new Set([
@@ -139,15 +149,28 @@ function MarketBarometer() {
       setFeedStatus((current) => ({ ...current, market: 'loading' }))
 
       const customMarketPromise = marketFeedUrl ? fetchRemoteFeed(marketFeedUrl) : Promise.resolve(null)
+      const onHistoryProgress = (bundle: { histories: Map<string, SymbolHistory>; intraday: Map<string, SymbolHistory> }) => {
+        if (bundle.histories.size > 0) {
+          setHistories(new Map(bundle.histories))
+          setFeedStatus((current) => ({ ...current, market: 'live' }))
+        }
+        if (bundle.intraday.size > 0) {
+          setIntraday(new Map(bundle.intraday))
+        }
+      }
+
       const historyPromise = options?.intradayDate
-        ? fetchMarketBundle({
-            symbols: allSymbols,
-            intradayDate: options.intradayDate,
-            intradaySymbols: intradaySymbolList,
-            skipDaily: true,
-            force: options.force,
-          })
-        : fetchMarketBundle({ symbols: allSymbols, force: options?.force })
+        ? fetchMarketBundle(
+            {
+              symbols: orderedSymbols,
+              intradayDate: options.intradayDate,
+              intradaySymbols: intradaySymbolList,
+              skipDaily: true,
+              force: options.force,
+            },
+            onHistoryProgress,
+          )
+        : fetchMarketBundle({ symbols: orderedSymbols, force: options?.force }, onHistoryProgress)
 
       const [customMarketResult, historyResult] = await Promise.allSettled([
         customMarketPromise,
@@ -185,7 +208,7 @@ function MarketBarometer() {
 
       setFeedStatus((current) => ({ ...current, market: marketStatus }))
     },
-    [allSymbols, intradaySymbolList],
+    [orderedSymbols, intradaySymbolList],
   )
 
   const loadNews = useCallback(async (date: string, time: string) => {

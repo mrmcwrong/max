@@ -7,7 +7,7 @@ const USER_AGENT =
 
 const DAILY_CACHE_TTL_MS = 90_000
 const INTRADAY_CACHE_TTL_MS = 120_000
-const FETCH_CONCURRENCY = 18
+const FETCH_CONCURRENCY = 12
 
 const LONG_HISTORY_SYMBOLS = new Set(['^IRX', '2YY=F', '^FVX', '^TNX', '^TYX'])
 

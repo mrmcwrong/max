@@ -34,6 +34,7 @@ const frameLookback: Record<TimeFrame, number> = {
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const CLIENT_CACHE_TTL_MS = 3 * 60 * 1000
+const BUNDLE_CHUNK_SIZE = 20
 
 type MarketBundleRequest = {
   symbols: string[]
@@ -42,6 +43,13 @@ type MarketBundleRequest = {
   skipDaily?: boolean
   force?: boolean
 }
+
+type MarketBundleResult = {
+  histories: Map<string, SymbolHistory>
+  intraday: Map<string, SymbolHistory>
+}
+
+type MarketBundleProgress = (bundle: MarketBundleResult) => void
 
 type MarketBundleCache = {
   histories: Record<string, SymbolHistory>
@@ -90,7 +98,37 @@ function mapsFromCache(data: MarketBundleCache) {
   }
 }
 
-export async function fetchMarketBundle(request: MarketBundleRequest) {
+function chunkSymbols(symbols: string[]) {
+  const unique = [...new Set(symbols.filter(Boolean))]
+  const chunks: string[][] = []
+
+  for (let index = 0; index < unique.length; index += BUNDLE_CHUNK_SIZE) {
+    chunks.push(unique.slice(index, index + BUNDLE_CHUNK_SIZE))
+  }
+
+  return chunks
+}
+
+async function postMarketBundle(body: {
+  symbols: string[]
+  intradayDate?: string
+  intradaySymbols?: string[]
+  skipDaily?: boolean
+}): Promise<MarketBundleCache> {
+  const response = await fetch('/api/markets/bundle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Market bundle request failed (${response.status})`)
+  }
+
+  return (await response.json()) as MarketBundleCache
+}
+
+export async function fetchMarketBundle(request: MarketBundleRequest, onProgress?: MarketBundleProgress) {
   const dailyKey = dailyCacheKey(request.symbols)
   const intradayKey =
     request.intradayDate && request.intradaySymbols?.length
@@ -102,59 +140,92 @@ export async function fetchMarketBundle(request: MarketBundleRequest) {
       const cachedIntraday = readClientCache(intradayKey)
       if (cachedIntraday) {
         const cachedDaily = readClientCache(dailyKey)
-        return {
+        const result = {
           histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
           intraday: new Map(Object.entries(cachedIntraday.intraday)),
         }
+        onProgress?.(result)
+        return result
       }
     } else if (!request.skipDaily && !request.intradayDate) {
       const cachedDaily = readClientCache(dailyKey)
       if (cachedDaily) {
-        return mapsFromCache(cachedDaily)
+        const result = mapsFromCache(cachedDaily)
+        onProgress?.(result)
+        return result
       }
     }
   }
 
-  const response = await fetch('/api/markets/bundle', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const useSingleRequest =
+    request.skipDaily || request.symbols.length <= BUNDLE_CHUNK_SIZE
+
+  if (useSingleRequest) {
+    const payload = await postMarketBundle({
       symbols: request.symbols,
       intradayDate: request.intradayDate,
       intradaySymbols: request.intradaySymbols,
       skipDaily: request.skipDaily ?? false,
-    }),
-  })
+    })
 
-  if (!response.ok) {
-    throw new Error('Market bundle request failed')
-  }
+    if (request.skipDaily) {
+      if (intradayKey) {
+        writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
+      }
 
-  const payload = (await response.json()) as MarketBundleCache
+      const cachedDaily = readClientCache(dailyKey)
+      const result = {
+        histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
+        intraday: new Map(Object.entries(payload.intraday)),
+      }
+      onProgress?.(result)
+      return result
+    }
 
-  if (request.skipDaily) {
-    if (intradayKey) {
+    writeClientCache(dailyKey, { histories: payload.histories, intraday: {} })
+    if (intradayKey && request.intradayDate) {
       writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
     }
 
-    const cachedDaily = readClientCache(dailyKey)
-    return {
-      histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
-      intraday: new Map(Object.entries(payload.intraday)),
-    }
+    const result = mapsFromCache(payload)
+    onProgress?.(result)
+    return result
+  }
+
+  const chunks = chunkSymbols(request.symbols)
+  const mergedHistories: Record<string, SymbolHistory> = {}
+  const mergedIntraday: Record<string, SymbolHistory> = {}
+  let completedChunks = 0
+
+  await Promise.all(
+    chunks.map(async (symbols) => {
+      try {
+        const payload = await postMarketBundle({ symbols, skipDaily: false })
+        Object.assign(mergedHistories, payload.histories)
+        completedChunks += 1
+        onProgress?.({
+          histories: new Map(Object.entries(mergedHistories)),
+          intraday: new Map(Object.entries(mergedIntraday)),
+        })
+      } catch {
+        // Keep partial results from successful chunks.
+      }
+    }),
+  )
+
+  if (completedChunks === 0) {
+    throw new Error('Market bundle request failed')
   }
 
   const cachePayload: MarketBundleCache = {
-    histories: payload.histories,
-    intraday: payload.intraday,
+    histories: mergedHistories,
+    intraday: mergedIntraday,
   }
-  writeClientCache(dailyKey, { histories: payload.histories, intraday: {} })
+  writeClientCache(dailyKey, cachePayload)
 
-  if (intradayKey && request.intradayDate) {
-    writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
-  }
-
-  return mapsFromCache(cachePayload)
+  const result = mapsFromCache(cachePayload)
+  onProgress?.(result)
+  return result
 }
 
 export async function fetchAllHistories(symbols: string[]) {
