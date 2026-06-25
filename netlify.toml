@@ -1,0 +1,34 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# API proxies (must come before the SPA catch-all)
+[[redirects]]
+  from = "/api/yahoo/chart"
+  to = "/.netlify/functions/yahoo-chart"
+  status = 200
+
+[[redirects]]
+  from = "/api/yahoo/movers"
+  to = "/.netlify/functions/yahoo-movers"
+  status = 200
+
+[[redirects]]
+  from = "/api/news"
+  to = "/.netlify/functions/news"
+  status = 200
+
+[[redirects]]
+  from = "/api/fred/history"
+  to = "/.netlify/functions/fred-history"
+  status = 200
+
+# React app — all other routes serve index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
