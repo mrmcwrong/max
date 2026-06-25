@@ -16,8 +16,6 @@ export type ComputedQuote = {
   series: number[]
 }
 
-const HISTORY_RANGE = '2y'
-
 const frameDays: Record<TimeFrame, number> = {
   '1D': 1,
   '1W': 7,
@@ -35,136 +33,143 @@ const frameLookback: Record<TimeFrame, number> = {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000
+const CLIENT_CACHE_TTL_MS = 3 * 60 * 1000
 
-type YahooChartResponse = {
-  chart?: {
-    result?: Array<{
-      timestamp?: number[]
-      indicators?: {
-        quote?: Array<{
-          open?: Array<number | null>
-          close?: Array<number | null>
-        }>
-      }
-    }>
-  }
+type MarketBundleRequest = {
+  symbols: string[]
+  intradayDate?: string
+  intradaySymbols?: string[]
+  skipDaily?: boolean
+  force?: boolean
 }
 
-function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolHistory | null {
-  const result = payload.chart?.result?.[0]
-  const timestamps = result?.timestamp ?? []
-  const quote = result?.indicators?.quote?.[0]
-  const open = quote?.open ?? []
-  const close = quote?.close ?? []
+type MarketBundleCache = {
+  histories: Record<string, SymbolHistory>
+  intraday: Record<string, SymbolHistory>
+}
 
-  if (timestamps.length === 0 || close.length === 0) {
-    return null
-  }
-
-  const cleanTimestamps: number[] = []
-  const cleanOpen: number[] = []
-  const cleanClose: number[] = []
-
-  for (let index = 0; index < timestamps.length; index += 1) {
-    const closeValue = close[index]
-    if (closeValue == null) {
-      continue
+function readClientCache(key: string): MarketBundleCache | null {
+  try {
+    const raw = sessionStorage.getItem(key)
+    if (!raw) {
+      return null
     }
 
-    cleanTimestamps.push(timestamps[index])
-    cleanClose.push(closeValue)
-    cleanOpen.push(open[index] ?? closeValue)
-  }
-
-  if (cleanClose.length === 0) {
-    return null
-  }
-
-  return { symbol, timestamps: cleanTimestamps, open: cleanOpen, close: cleanClose }
-}
-
-export async function fetchSymbolHistory(symbol: string): Promise<SymbolHistory | null> {
-  if (symbol.startsWith('fred:')) {
-    const seriesId = symbol.slice(5)
-    const response = await fetch(
-      `/api/fred/history?series=${encodeURIComponent(seriesId)}`,
-      { cache: 'no-store' },
-    )
-
-    if (!response.ok) {
-      throw new Error(`FRED history request failed for ${seriesId}`)
+    const parsed = JSON.parse(raw) as { expires: number; data: MarketBundleCache }
+    if (parsed.expires <= Date.now()) {
+      sessionStorage.removeItem(key)
+      return null
     }
 
-    return (await response.json()) as SymbolHistory
-  }
-
-  const response = await fetch(
-    `/api/yahoo/chart?symbol=${encodeURIComponent(symbol)}&range=${encodeURIComponent(HISTORY_RANGE)}`,
-    { cache: 'no-store' },
-  )
-
-  if (!response.ok) {
-    throw new Error(`History request failed for ${symbol}`)
-  }
-
-  const payload = (await response.json()) as YahooChartResponse
-  return parseChartPayload(payload, symbol)
-}
-
-export async function fetchIntradayHistory(
-  symbol: string,
-  dayStartMs: number,
-): Promise<SymbolHistory | null> {
-  if (symbol.startsWith('fred:')) {
+    return parsed.data
+  } catch {
     return null
   }
+}
 
-  const period1 = Math.floor(dayStartMs / 1000)
-  const period2 = period1 + 24 * 60 * 60
-  const response = await fetch(
-    `/api/yahoo/chart?symbol=${encodeURIComponent(symbol)}&interval=60m&period1=${period1}&period2=${period2}`,
-    { cache: 'no-store' },
-  )
+function writeClientCache(key: string, data: MarketBundleCache) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ expires: Date.now() + CLIENT_CACHE_TTL_MS, data }))
+  } catch {
+    // Ignore storage quota errors.
+  }
+}
+
+function dailyCacheKey(symbols: string[]) {
+  return `max:daily:${[...symbols].sort().join('|')}`
+}
+
+function intradayCacheKey(date: string, symbols: string[]) {
+  return `max:intraday:${date}:${[...symbols].sort().join('|')}`
+}
+
+function mapsFromCache(data: MarketBundleCache) {
+  return {
+    histories: new Map(Object.entries(data.histories)),
+    intraday: new Map(Object.entries(data.intraday)),
+  }
+}
+
+export async function fetchMarketBundle(request: MarketBundleRequest) {
+  const dailyKey = dailyCacheKey(request.symbols)
+  const intradayKey =
+    request.intradayDate && request.intradaySymbols?.length
+      ? intradayCacheKey(request.intradayDate, request.intradaySymbols)
+      : null
+
+  if (!request.force) {
+    if (request.skipDaily && intradayKey) {
+      const cachedIntraday = readClientCache(intradayKey)
+      if (cachedIntraday) {
+        const cachedDaily = readClientCache(dailyKey)
+        return {
+          histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
+          intraday: new Map(Object.entries(cachedIntraday.intraday)),
+        }
+      }
+    } else if (!request.skipDaily && !request.intradayDate) {
+      const cachedDaily = readClientCache(dailyKey)
+      if (cachedDaily) {
+        return mapsFromCache(cachedDaily)
+      }
+    }
+  }
+
+  const response = await fetch('/api/markets/bundle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      symbols: request.symbols,
+      intradayDate: request.intradayDate,
+      intradaySymbols: request.intradaySymbols,
+      skipDaily: request.skipDaily ?? false,
+    }),
+  })
 
   if (!response.ok) {
-    throw new Error(`Intraday request failed for ${symbol}`)
+    throw new Error('Market bundle request failed')
   }
 
-  const payload = (await response.json()) as YahooChartResponse
-  return parseChartPayload(payload, symbol)
-}
+  const payload = (await response.json()) as MarketBundleCache
 
-async function fetchInBatches(
-  symbols: string[],
-  loader: (symbol: string) => Promise<SymbolHistory | null>,
-): Promise<Map<string, SymbolHistory>> {
-  const unique = [...new Set(symbols.filter(Boolean))]
-  const map = new Map<string, SymbolHistory>()
-  const batchSize = 8
+  if (request.skipDaily) {
+    if (intradayKey) {
+      writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
+    }
 
-  for (let index = 0; index < unique.length; index += batchSize) {
-    const batch = unique.slice(index, index + batchSize)
-    const results = await Promise.allSettled(batch.map((symbol) => loader(symbol)))
-
-    results.forEach((result, offset) => {
-      if (result.status === 'fulfilled' && result.value) {
-        map.set(batch[offset], result.value)
-      }
-    })
+    const cachedDaily = readClientCache(dailyKey)
+    return {
+      histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
+      intraday: new Map(Object.entries(payload.intraday)),
+    }
   }
 
-  return map
+  const cachePayload: MarketBundleCache = {
+    histories: payload.histories,
+    intraday: payload.intraday,
+  }
+  writeClientCache(dailyKey, { histories: payload.histories, intraday: {} })
+
+  if (intradayKey && request.intradayDate) {
+    writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
+  }
+
+  return mapsFromCache(cachePayload)
 }
 
-export async function fetchAllHistories(symbols: string[]): Promise<Map<string, SymbolHistory>> {
-  return fetchInBatches(symbols, fetchSymbolHistory)
+export async function fetchAllHistories(symbols: string[]) {
+  const bundle = await fetchMarketBundle({ symbols })
+  return bundle.histories
 }
 
-export async function fetchAllIntraday(
-  symbols: string[],
-  dayStartMs: number,
-): Promise<Map<string, SymbolHistory>> {
-  return fetchInBatches(symbols, (symbol) => fetchIntradayHistory(symbol, dayStartMs))
+export async function fetchIntradayForSymbols(symbols: string[], intradayDate: string) {
+  const bundle = await fetchMarketBundle({
+    symbols: [],
+    intradayDate,
+    intradaySymbols: symbols,
+    skipDaily: true,
+  })
+  return bundle.intraday
 }
 
 function indexAtOrBefore(timestamps: number[], targetMs: number, upperBound = timestamps.length - 1) {

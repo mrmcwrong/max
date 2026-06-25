@@ -223,6 +223,16 @@ export async function handleNewsFeed(req: IncomingMessage, res: ServerResponse) 
   const params = readQuery(req)
   const date = params.get('date')
   const time = params.get('time')
+  const cacheKey = `news:${date ?? 'now'}:${time ?? '16:00'}`
+  const cachedNews = readNewsCache(cacheKey)
+  if (cachedNews) {
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/json')
+    res.setHeader('Cache-Control', 'private, max-age=60')
+    res.end(JSON.stringify(cachedNews))
+    return
+  }
+
   const snapshotMs =
     date && /^\d{4}-\d{2}-\d{2}$/.test(date)
       ? estDateTimeToMs(date, time && /^\d{2}:\d{2}$/.test(time) ? time : '16:00')
@@ -271,9 +281,11 @@ export async function handleNewsFeed(req: IncomingMessage, res: ServerResponse) 
     detail: formatNewsDetail(publishedAt),
   }))
 
+  writeNewsCache(cacheKey, headlines)
+
   res.statusCode = 200
   res.setHeader('Content-Type', 'application/json')
-  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Cache-Control', 'private, max-age=60')
   res.end(JSON.stringify(headlines))
 }
 
@@ -282,6 +294,22 @@ type NewsItem = {
   title: string
   detail: string
   url: string
+}
+
+const newsCache = new Map<string, { expires: number; headlines: NewsItem[] }>()
+const NEWS_CACHE_TTL_MS = 90_000
+
+function readNewsCache(key: string) {
+  const entry = newsCache.get(key)
+  if (!entry || entry.expires <= Date.now()) {
+    newsCache.delete(key)
+    return null
+  }
+  return entry.headlines
+}
+
+function writeNewsCache(key: string, headlines: NewsItem[]) {
+  newsCache.set(key, { expires: Date.now() + NEWS_CACHE_TTL_MS, headlines })
 }
 
 type ParsedNewsItem = NewsItem & {

@@ -29,8 +29,8 @@ import {
   computeIntradayQuote,
   computeQuote,
   estDateTimeToMs,
-  fetchAllHistories,
-  fetchAllIntraday,
+  fetchIntradayForSymbols,
+  fetchMarketBundle,
   fetchLiveHeadlines,
   formatPercentWithAmount,
   formatSignedAmount,
@@ -124,34 +124,69 @@ function MarketBarometer() {
     [],
   )
 
-  const loadFeeds = useCallback(async () => {
-    setFeedStatus((current) => ({ ...current, market: 'loading' }))
+  const intradaySymbolList = useMemo(
+    () => [
+      ...new Set([
+        ...Object.values(summarySymbols),
+        ...treasuryCurveSymbols.map((point) => point.symbol),
+      ]),
+    ],
+    [],
+  )
 
-    const customMarketPromise = marketFeedUrl ? fetchRemoteFeed(marketFeedUrl) : Promise.resolve(null)
-    const historyPromise = fetchAllHistories(allSymbols)
+  const loadFeeds = useCallback(
+    async (options?: { force?: boolean; intradayDate?: string }) => {
+      setFeedStatus((current) => ({ ...current, market: 'loading' }))
 
-    const [customMarketResult, historyResult] = await Promise.allSettled([
-      customMarketPromise,
-      historyPromise,
-    ])
+      const customMarketPromise = marketFeedUrl ? fetchRemoteFeed(marketFeedUrl) : Promise.resolve(null)
+      const historyPromise = options?.intradayDate
+        ? fetchMarketBundle({
+            symbols: allSymbols,
+            intradayDate: options.intradayDate,
+            intradaySymbols: intradaySymbolList,
+            skipDaily: true,
+            force: options.force,
+          })
+        : fetchMarketBundle({ symbols: allSymbols, force: options?.force })
 
-    let marketStatus: FeedStatus = 'fallback'
+      const [customMarketResult, historyResult] = await Promise.allSettled([
+        customMarketPromise,
+        historyPromise,
+      ])
 
-    if (historyResult.status === 'fulfilled' && historyResult.value.size > 0) {
-      setHistories(historyResult.value)
-      marketStatus = 'live'
-    } else {
-      setHistories(new Map())
-      marketStatus = historyResult.status === 'rejected' ? 'error' : 'fallback'
-    }
+      let marketStatus: FeedStatus = 'fallback'
 
-    if (customMarketResult.status === 'fulfilled' && customMarketResult.value) {
-      setCustomMarketFeed(normalizeMarketFeed(customMarketResult.value))
-      marketStatus = 'live'
-    }
+      if (historyResult.status === 'fulfilled') {
+        const bundle = historyResult.value
+        if (bundle.histories.size > 0 || bundle.intraday.size > 0) {
+          if (bundle.histories.size > 0) {
+            setHistories(bundle.histories)
+          }
+          if (bundle.intraday.size > 0) {
+            setIntraday(bundle.intraday)
+            if (options?.intradayDate) {
+              setIntradayDate(options.intradayDate)
+            }
+          }
+          marketStatus = 'live'
+        } else {
+          setHistories(new Map())
+          marketStatus = 'fallback'
+        }
+      } else {
+        setHistories(new Map())
+        marketStatus = 'error'
+      }
 
-    setFeedStatus((current) => ({ ...current, market: marketStatus }))
-  }, [allSymbols])
+      if (customMarketResult.status === 'fulfilled' && customMarketResult.value) {
+        setCustomMarketFeed(normalizeMarketFeed(customMarketResult.value))
+        marketStatus = 'live'
+      }
+
+      setFeedStatus((current) => ({ ...current, market: marketStatus }))
+    },
+    [allSymbols, intradaySymbolList],
+  )
 
   const loadNews = useCallback(async (date: string, time: string) => {
     setFeedStatus((current) => ({ ...current, news: 'loading' }))
@@ -188,7 +223,7 @@ function MarketBarometer() {
     setIntradayDate(null)
     setIntraday(new Map())
 
-    await Promise.all([loadFeeds(), loadNews(now.date, now.time)])
+    await Promise.all([loadFeeds({ force: true, intradayDate: now.date }), loadNews(now.date, now.time)])
   }, [loadFeeds, loadNews])
 
   const effectiveNewsTime = snapshotTimeForMode(timeMode, customTime)
@@ -208,9 +243,8 @@ function MarketBarometer() {
 
     let cancelled = false
     setIntradayLoading(true)
-    const dayStart = new Date(`${snapshotDate}T00:00:00`).getTime()
 
-    void fetchAllIntraday(allSymbols, dayStart)
+    void fetchIntradayForSymbols(intradaySymbolList, snapshotDate)
       .then((map) => {
         if (cancelled) {
           return
@@ -228,7 +262,7 @@ function MarketBarometer() {
     return () => {
       cancelled = true
     }
-  }, [timeMode, snapshotDate, histories, allSymbols, intradayDate])
+  }, [timeMode, snapshotDate, histories, intradaySymbolList, intradayDate])
 
   const snapshotDateMs = useMemo(() => {
     const parsed = new Date(`${snapshotDate}T23:59:59`)
