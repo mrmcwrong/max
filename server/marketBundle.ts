@@ -5,9 +5,9 @@ const YAHOO_CHART = 'https://query1.finance.yahoo.com/v8/finance/chart'
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
 
-const DAILY_CACHE_TTL_MS = 90_000
+const DAILY_CACHE_TTL_MS = 5 * 60 * 1000
 const INTRADAY_CACHE_TTL_MS = 120_000
-const FETCH_CONCURRENCY = 12
+const FETCH_CONCURRENCY = 18
 
 const LONG_HISTORY_SYMBOLS = new Set(['^IRX', '2YY=F', '^FVX', '^TNX', '^TYX'])
 

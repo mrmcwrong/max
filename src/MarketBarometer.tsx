@@ -47,6 +47,7 @@ import {
   fetchBreakingHeadlines,
   fetchMarketBundle,
   fetchLiveHeadlines,
+  hydrateMarketCache,
   formatCompactChange,
   formatDisplaySymbol,
   getNowEst,
@@ -222,23 +223,37 @@ function MarketBarometer() {
     [],
   )
 
-  const barometerSymbolList = useMemo(() => collectBarometerSymbols(), [])
-  const fixedIncomeSymbolList = useMemo(() => collectFixedIncomeSymbols(), [])
+  const mergeMarketBundle = useCallback(
+    (bundle: { histories: Map<string, SymbolHistory>; intraday: Map<string, SymbolHistory> }) => {
+      if (bundle.histories.size > 0) {
+        setHistories((current) => {
+          const next = new Map(current)
+          bundle.histories.forEach((history, symbol) => next.set(symbol, history))
+          return next
+        })
+        setFeedStatus((current) => ({ ...current, market: 'live' }))
+      }
+
+      if (bundle.intraday.size > 0) {
+        setIntraday((current) => {
+          const next = new Map(current)
+          bundle.intraday.forEach((history, symbol) => next.set(symbol, history))
+          return next
+        })
+      }
+    },
+    [],
+  )
 
   const loadFeeds = useCallback(
     async (options?: { force?: boolean; intradayDate?: string }) => {
-      setFeedStatus((current) => ({ ...current, market: 'loading' }))
+      setFeedStatus((current) => ({
+        ...current,
+        market: options?.force || current.market !== 'live' ? 'loading' : 'live',
+      }))
 
       const customMarketPromise = marketFeedUrl ? fetchRemoteFeed(marketFeedUrl) : Promise.resolve(null)
-      const onHistoryProgress = (bundle: { histories: Map<string, SymbolHistory>; intraday: Map<string, SymbolHistory> }) => {
-        if (bundle.histories.size > 0) {
-          setHistories(new Map(bundle.histories))
-          setFeedStatus((current) => ({ ...current, market: 'live' }))
-        }
-        if (bundle.intraday.size > 0) {
-          setIntraday(new Map(bundle.intraday))
-        }
-      }
+      const onHistoryProgress = mergeMarketBundle
 
       const historyPromise = options?.intradayDate
         ? fetchMarketBundle(
@@ -253,22 +268,7 @@ function MarketBarometer() {
           )
         : fetchMarketBundle({ symbols: orderedSymbols, force: options?.force }, onHistoryProgress)
 
-      const barometerPromise = fetchMarketBundle(
-        { symbols: barometerSymbolList, force: options?.force },
-        onHistoryProgress,
-      )
-
-      const fixedIncomePromise = fetchMarketBundle(
-        { symbols: fixedIncomeSymbolList, force: options?.force },
-        onHistoryProgress,
-      )
-
-      const [customMarketResult, historyResult, barometerResult, fixedIncomeResult] = await Promise.allSettled([
-        customMarketPromise,
-        historyPromise,
-        barometerPromise,
-        fixedIncomePromise,
-      ])
+      const [customMarketResult, historyResult] = await Promise.allSettled([customMarketPromise, historyPromise])
 
       let marketStatus: FeedStatus = 'fallback'
       const mergedHistories = new Map<string, SymbolHistory>()
@@ -287,14 +287,6 @@ function MarketBarometer() {
         absorbBundle(historyResult.value)
       }
 
-      if (barometerResult.status === 'fulfilled') {
-        absorbBundle(barometerResult.value)
-      }
-
-      if (fixedIncomeResult.status === 'fulfilled') {
-        absorbBundle(fixedIncomeResult.value)
-      }
-
       if (mergedHistories.size > 0 || mergedIntraday.size > 0) {
         setHistories(mergedHistories)
         if (mergedIntraday.size > 0) {
@@ -304,11 +296,7 @@ function MarketBarometer() {
           }
         }
         marketStatus = 'live'
-      } else if (
-        historyResult.status === 'rejected' &&
-        barometerResult.status === 'rejected' &&
-        fixedIncomeResult.status === 'rejected'
-      ) {
+      } else if (historyResult.status === 'rejected') {
         setHistories(new Map())
         marketStatus = 'error'
       } else {
@@ -323,44 +311,49 @@ function MarketBarometer() {
 
       setFeedStatus((current) => ({ ...current, market: marketStatus }))
     },
-    [orderedSymbols, intradaySymbolList, barometerSymbolList, fixedIncomeSymbolList],
+    [orderedSymbols, intradaySymbolList, mergeMarketBundle],
   )
 
   const loadNews = useCallback(async (date: string, time: string) => {
     setFeedStatus((current) => ({ ...current, news: 'loading' }))
 
     const customNewsPromise = newsFeedUrl ? fetchRemoteFeed(newsFeedUrl) : Promise.resolve(null)
-    const newsPromise = fetchLiveHeadlines(date, time)
-    const breakingPromise = fetchBreakingHeadlines()
-
-    const [customNewsResult, newsResult, breakingResult] = await Promise.allSettled([
-      customNewsPromise,
-      newsPromise,
-      breakingPromise,
-    ])
-
     let newsStatus: FeedStatus = 'fallback'
 
-    if (newsResult.status === 'fulfilled' && newsResult.value.length > 0) {
-      setLiveHeadlines(newsResult.value)
-      newsStatus = 'live'
-    } else {
-      setLiveHeadlines([])
-      newsStatus = newsResult.status === 'rejected' ? 'error' : 'fallback'
-    }
+    try {
+      const [customNewsResult, newsResult] = await Promise.allSettled([
+        customNewsPromise,
+        fetchLiveHeadlines(date, time),
+      ])
 
-    if (breakingResult.status === 'fulfilled') {
-      setBreakingHeadlines(breakingResult.value)
-    } else {
-      setBreakingHeadlines([])
-    }
+      if (newsResult.status === 'fulfilled' && newsResult.value.length > 0) {
+        setLiveHeadlines(newsResult.value)
+        newsStatus = 'live'
+        setFeedStatus((current) => ({ ...current, news: newsStatus }))
+      } else {
+        setLiveHeadlines([])
+        if (newsResult.status === 'rejected') {
+          newsStatus = 'error'
+        }
+      }
 
-    if (customNewsResult.status === 'fulfilled' && customNewsResult.value) {
-      setCustomNewsFeed(normalizeHeadlineFeed(customNewsResult.value))
-      newsStatus = 'live'
+      if (customNewsResult.status === 'fulfilled' && customNewsResult.value) {
+        setCustomNewsFeed(normalizeHeadlineFeed(customNewsResult.value))
+        newsStatus = 'live'
+      }
+    } catch {
+      newsStatus = 'error'
     }
 
     setFeedStatus((current) => ({ ...current, news: newsStatus }))
+
+    void fetchBreakingHeadlines()
+      .then((headlines) => {
+        setBreakingHeadlines(headlines)
+      })
+      .catch(() => {
+        setBreakingHeadlines([])
+      })
   }, [])
 
   const enableLiveView = useCallback(async () => {
@@ -376,6 +369,13 @@ function MarketBarometer() {
   }, [loadFeeds, loadNews])
 
   const effectiveNewsTime = snapshotTimeForMode(timeMode, customTime)
+
+  useLayoutEffect(() => {
+    const cached = hydrateMarketCache(orderedSymbols)
+    if (cached) {
+      mergeMarketBundle(cached)
+    }
+  }, [orderedSymbols, mergeMarketBundle])
 
   useEffect(() => {
     void loadFeeds()

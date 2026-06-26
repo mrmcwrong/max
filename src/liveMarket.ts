@@ -33,8 +33,10 @@ const frameLookback: Record<TimeFrame, number> = {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000
-const CLIENT_CACHE_TTL_MS = 3 * 60 * 1000
-const BUNDLE_CHUNK_SIZE = 20
+const SESSION_CACHE_TTL_MS = 30 * 60 * 1000
+const LOCAL_CACHE_TTL_MS = 4 * 60 * 60 * 1000
+const BUNDLE_CHUNK_SIZE = 50
+const LOCAL_CACHE_PREFIX = 'max:local:daily:v1:'
 
 type MarketBundleRequest = {
   symbols: string[]
@@ -56,14 +58,19 @@ type MarketBundleCache = {
   intraday: Record<string, SymbolHistory>
 }
 
-function readClientCache(key: string): MarketBundleCache | null {
+type CachedBundle = {
+  expires: number
+  data: MarketBundleCache
+}
+
+function readSessionCache(key: string): MarketBundleCache | null {
   try {
     const raw = sessionStorage.getItem(key)
     if (!raw) {
       return null
     }
 
-    const parsed = JSON.parse(raw) as { expires: number; data: MarketBundleCache }
+    const parsed = JSON.parse(raw) as CachedBundle
     if (parsed.expires <= Date.now()) {
       sessionStorage.removeItem(key)
       return null
@@ -75,12 +82,69 @@ function readClientCache(key: string): MarketBundleCache | null {
   }
 }
 
-function writeClientCache(key: string, data: MarketBundleCache) {
+function writeSessionCache(key: string, data: MarketBundleCache, ttlMs = SESSION_CACHE_TTL_MS) {
   try {
-    sessionStorage.setItem(key, JSON.stringify({ expires: Date.now() + CLIENT_CACHE_TTL_MS, data }))
+    sessionStorage.setItem(key, JSON.stringify({ expires: Date.now() + ttlMs, data }))
   } catch {
     // Ignore storage quota errors.
   }
+}
+
+function readLocalCache(key: string): CachedBundle | null {
+  try {
+    const raw = localStorage.getItem(`${LOCAL_CACHE_PREFIX}${key}`)
+    if (!raw) {
+      return null
+    }
+
+    return JSON.parse(raw) as CachedBundle
+  } catch {
+    return null
+  }
+}
+
+function writeLocalCache(key: string, data: MarketBundleCache) {
+  try {
+    localStorage.setItem(
+      `${LOCAL_CACHE_PREFIX}${key}`,
+      JSON.stringify({ expires: Date.now() + LOCAL_CACHE_TTL_MS, data }),
+    )
+  } catch {
+    // Ignore storage quota errors.
+  }
+}
+
+function readCachedDaily(key: string) {
+  const local = readLocalCache(key)
+  if (local && local.expires > Date.now()) {
+    return { data: local.data, fresh: true, source: 'local' as const }
+  }
+
+  const session = readSessionCache(key)
+  if (session) {
+    return { data: session, fresh: true, source: 'session' as const }
+  }
+
+  if (local) {
+    return { data: local.data, fresh: false, source: 'local' as const }
+  }
+
+  return null
+}
+
+function writeDailyCache(key: string, data: MarketBundleCache) {
+  writeSessionCache(key, data)
+  writeLocalCache(key, data)
+}
+
+/** Hydrate the UI immediately from device cache before network requests finish. */
+export function hydrateMarketCache(symbols: string[]): MarketBundleResult | null {
+  const cached = readCachedDaily(dailyCacheKey(symbols))
+  if (!cached) {
+    return null
+  }
+
+  return mapsFromCache(cached.data)
 }
 
 function dailyCacheKey(symbols: string[]) {
@@ -137,22 +201,24 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
 
   if (!request.force) {
     if (request.skipDaily && intradayKey) {
-      const cachedIntraday = readClientCache(intradayKey)
+      const cachedIntraday = readSessionCache(intradayKey)
       if (cachedIntraday) {
-        const cachedDaily = readClientCache(dailyKey)
+        const cachedDaily = readCachedDaily(dailyKey)
         const result = {
-          histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
+          histories: new Map(Object.entries(cachedDaily?.data.histories ?? {})),
           intraday: new Map(Object.entries(cachedIntraday.intraday)),
         }
         onProgress?.(result)
         return result
       }
     } else if (!request.skipDaily && !request.intradayDate) {
-      const cachedDaily = readClientCache(dailyKey)
+      const cachedDaily = readCachedDaily(dailyKey)
       if (cachedDaily) {
-        const result = mapsFromCache(cachedDaily)
+        const result = mapsFromCache(cachedDaily.data)
         onProgress?.(result)
-        return result
+        if (cachedDaily.fresh) {
+          return result
+        }
       }
     }
   }
@@ -170,21 +236,21 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
 
     if (request.skipDaily) {
       if (intradayKey) {
-        writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
+        writeSessionCache(intradayKey, { histories: {}, intraday: payload.intraday })
       }
 
-      const cachedDaily = readClientCache(dailyKey)
+      const cachedDaily = readCachedDaily(dailyKey)
       const result = {
-        histories: new Map(Object.entries(cachedDaily?.histories ?? {})),
+        histories: new Map(Object.entries(cachedDaily?.data.histories ?? {})),
         intraday: new Map(Object.entries(payload.intraday)),
       }
       onProgress?.(result)
       return result
     }
 
-    writeClientCache(dailyKey, { histories: payload.histories, intraday: {} })
+    writeDailyCache(dailyKey, { histories: payload.histories, intraday: {} })
     if (intradayKey && request.intradayDate) {
-      writeClientCache(intradayKey, { histories: {}, intraday: payload.intraday })
+      writeSessionCache(intradayKey, { histories: {}, intraday: payload.intraday })
     }
 
     const result = mapsFromCache(payload)
@@ -226,7 +292,7 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
     histories: mergedHistories,
     intraday: mergedIntraday,
   }
-  writeClientCache(dailyKey, cachePayload)
+  writeDailyCache(dailyKey, cachePayload)
 
   const result = mapsFromCache(cachePayload)
   onProgress?.(result)
