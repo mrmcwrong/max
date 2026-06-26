@@ -7,9 +7,9 @@ const USER_AGENT =
 
 const DAILY_CACHE_TTL_MS = 5 * 60 * 1000
 const INTRADAY_CACHE_TTL_MS = 120_000
-const FETCH_CONCURRENCY = 12
+const FETCH_CONCURRENCY = 10
 /** Return partial results before Netlify's hard kill (10s on free tier). */
-const FUNCTION_BUDGET_MS = 8_500
+const FUNCTION_BUDGET_MS = 9_000
 
 const LONG_HISTORY_SYMBOLS = new Set(['^IRX', '2YY=F', '^FVX', '^TNX', '^TYX'])
 

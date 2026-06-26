@@ -1,4 +1,4 @@
-import { collectUsEquityPrioritySymbols, type TimeFrame, type Unit } from './instrumentCatalog'
+import { collectUsEquityPrioritySymbols, collectFixedIncomeSymbols, type TimeFrame, type Unit } from './instrumentCatalog'
 import { collectCountryIndexSymbols } from './barometer/countryIndexCatalog'
 
 export type TimeMode = 'open' | 'close' | 'custom'
@@ -36,12 +36,15 @@ const frameLookback: Record<TimeFrame, number> = {
 const DAY_MS = 24 * 60 * 60 * 1000
 const SESSION_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_CACHE_TTL_MS = 4 * 60 * 60 * 1000
-const BUNDLE_CHUNK_SIZE = 18
+const BUNDLE_CHUNK_SIZE = 12
 const LOCAL_CACHE_PREFIX = 'max:local:daily:v2:'
+const SYMBOL_CACHE_PREFIX = 'max:sym:v1:'
 const MAP_BUNDLE_CACHE_KEY = 'max:map:daily:v1:country-indexes'
 const US_EQUITY_BUNDLE_CACHE_KEY = 'max:us-equity:daily:v1:priority'
-const MIN_BUNDLE_COVERAGE = 0.88
+const FIXED_INCOME_BUNDLE_CACHE_KEY = 'max:fixed-income:daily:v1'
+const MIN_BUNDLE_COVERAGE = 0.6
 const MIN_MAP_COVERAGE = 0.85
+const MAX_CONCURRENT_BUNDLE_REQUESTS = 2
 
 type MarketBundleRequest = {
   symbols: string[]
@@ -67,6 +70,14 @@ type CachedBundle = {
   expires: number
   data: MarketBundleCache
 }
+
+type SymbolCacheEntry = {
+  expires: number
+  history: SymbolHistory
+}
+
+let activeBundleRequests = 0
+const bundleWaiters: Array<() => void> = []
 
 function readSessionCache(key: string): MarketBundleCache | null {
   try {
@@ -119,6 +130,79 @@ function writeLocalCache(key: string, data: MarketBundleCache) {
   }
 }
 
+function readSymbolHistory(symbol: string): SymbolHistory | null {
+  try {
+    const raw = localStorage.getItem(`${SYMBOL_CACHE_PREFIX}${symbol}`)
+    if (!raw) {
+      return null
+    }
+
+    const parsed = JSON.parse(raw) as SymbolCacheEntry
+    if (parsed.expires <= Date.now()) {
+      return null
+    }
+
+    return parsed.history
+  } catch {
+    return null
+  }
+}
+
+function writeSymbolHistory(history: SymbolHistory) {
+  try {
+    localStorage.setItem(
+      `${SYMBOL_CACHE_PREFIX}${history.symbol}`,
+      JSON.stringify({ expires: Date.now() + LOCAL_CACHE_TTL_MS, history }),
+    )
+  } catch {
+    // Ignore storage quota errors.
+  }
+}
+
+function readSymbolHistories(symbols: string[]) {
+  const histories = new Map<string, SymbolHistory>()
+  for (const symbol of symbols) {
+    const history = readSymbolHistory(symbol)
+    if (history) {
+      histories.set(symbol, history)
+    }
+  }
+  return histories
+}
+
+function writeSymbolHistories(histories: Record<string, SymbolHistory>) {
+  for (const history of Object.values(histories)) {
+    if (history?.symbol) {
+      writeSymbolHistory(history)
+    }
+  }
+}
+
+function symbolsNeedingFetch(symbols: string[], force?: boolean) {
+  if (force) {
+    return symbols
+  }
+
+  return symbols.filter((symbol) => !readSymbolHistory(symbol))
+}
+
+async function withBundleSlot<T>(work: () => Promise<T>): Promise<T> {
+  while (activeBundleRequests >= MAX_CONCURRENT_BUNDLE_REQUESTS) {
+    await new Promise<void>((resolve) => bundleWaiters.push(resolve))
+  }
+
+  activeBundleRequests += 1
+  try {
+    return await work()
+  } finally {
+    activeBundleRequests -= 1
+    const next = bundleWaiters.shift()
+    if (next) {
+      next()
+    }
+  }
+}
+
 function readCachedDaily(key: string) {
   const local = readLocalCache(key)
   if (local && local.expires > Date.now()) {
@@ -144,12 +228,22 @@ function writeDailyCache(key: string, data: MarketBundleCache) {
 
 /** Hydrate the UI immediately from device cache before network requests finish. */
 export function hydrateMarketCache(symbols: string[]): MarketBundleResult | null {
+  const histories = readSymbolHistories(symbols)
   const cached = readCachedDaily(dailyCacheKey(symbols))
-  if (!cached) {
+
+  if (cached) {
+    for (const [symbol, history] of Object.entries(cached.data.histories)) {
+      if (!histories.has(symbol)) {
+        histories.set(symbol, history)
+      }
+    }
+  }
+
+  if (histories.size === 0) {
     return null
   }
 
-  return mapsFromCache(cached.data)
+  return { histories, intraday: new Map() }
 }
 
 export function hydrateCountryMapCache(): MarketBundleResult | null {
@@ -226,33 +320,83 @@ async function postMarketBundle(body: {
   intradaySymbols?: string[]
   skipDaily?: boolean
 }): Promise<MarketBundleCache> {
-  const response = await fetch('/api/markets/bundle', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  return withBundleSlot(async () => {
+    const response = await fetch('/api/markets/bundle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
 
-  if (!response.ok) {
-    throw new Error(`Market bundle request failed (${response.status})`)
+    if (!response.ok) {
+      throw new Error(`Market bundle request failed (${response.status})`)
+    }
+
+    const payload = (await response.json()) as MarketBundleCache
+    if (!body.skipDaily) {
+      writeSymbolHistories(payload.histories)
+    }
+    return payload
+  })
+}
+
+function seedBundleFromCaches(
+  symbols: string[],
+  dailyKey: string,
+  mergedHistories: Record<string, SymbolHistory>,
+  mergedIntraday: Record<string, SymbolHistory>,
+) {
+  for (const [symbol, history] of readSymbolHistories(symbols)) {
+    mergedHistories[symbol] = history
   }
 
-  return (await response.json()) as MarketBundleCache
+  const existingDaily = readCachedDaily(dailyKey)?.data
+  if (existingDaily) {
+    Object.assign(mergedHistories, existingDaily.histories)
+    Object.assign(mergedIntraday, existingDaily.intraday)
+  }
+}
+
+function persistBundleProgress(
+  symbols: string[],
+  dailyKey: string,
+  cachePayload: MarketBundleCache,
+  existingDaily?: MarketBundleCache,
+) {
+  writeSymbolHistories(cachePayload.histories)
+
+  if (bundleCoverage(symbols, cachePayload) >= MIN_BUNDLE_COVERAGE) {
+    writeDailyCache(dailyKey, cachePayload)
+    return
+  }
+
+  if (existingDaily) {
+    writeDailyCache(dailyKey, mergeBundleCaches(existingDaily, cachePayload))
+    return
+  }
+
+  writeDailyCache(dailyKey, cachePayload)
 }
 
 export async function fetchMarketBundle(request: MarketBundleRequest, onProgress?: MarketBundleProgress) {
-  const dailyKey = dailyCacheKey(request.symbols)
+  const requestedSymbols = [...new Set(request.symbols.filter(Boolean))]
+  const symbolsToFetch = symbolsNeedingFetch(requestedSymbols, request.force)
+  const dailyKey = dailyCacheKey(requestedSymbols)
   const intradayKey =
     request.intradayDate && request.intradaySymbols?.length
       ? intradayCacheKey(request.intradayDate, request.intradaySymbols)
       : null
 
+  const cachedHistories = readSymbolHistories(requestedSymbols)
+  if (cachedHistories.size > 0) {
+    onProgress?.({ histories: cachedHistories, intraday: new Map() })
+  }
+
   if (!request.force) {
     if (request.skipDaily && intradayKey) {
       const cachedIntraday = readSessionCache(intradayKey)
       if (cachedIntraday) {
-        const cachedDaily = readCachedDaily(dailyKey)
         const result = {
-          histories: new Map(Object.entries(cachedDaily?.data.histories ?? {})),
+          histories: cachedHistories,
           intraday: new Map(Object.entries(cachedIntraday.intraday)),
         }
         onProgress?.(result)
@@ -261,9 +405,16 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
     } else if (!request.skipDaily && !request.intradayDate) {
       const cachedDaily = readCachedDaily(dailyKey)
       if (cachedDaily) {
-        const result = mapsFromCache(cachedDaily.data)
+        const merged = new Map(cachedHistories)
+        for (const [symbol, history] of Object.entries(cachedDaily.data.histories)) {
+          merged.set(symbol, history)
+        }
+        const result = { histories: merged, intraday: new Map() }
         onProgress?.(result)
-        const coverage = bundleCoverage(request.symbols, cachedDaily.data)
+        const coverage = bundleCoverage(requestedSymbols, {
+          histories: Object.fromEntries(merged),
+          intraday: {},
+        })
         if (cachedDaily.fresh && coverage >= MIN_BUNDLE_COVERAGE) {
           return result
         }
@@ -271,12 +422,16 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
     }
   }
 
+  if (symbolsToFetch.length === 0 && !request.intradayDate) {
+    return { histories: cachedHistories, intraday: new Map() }
+  }
+
   const useSingleRequest =
-    request.skipDaily || request.symbols.length <= BUNDLE_CHUNK_SIZE
+    request.skipDaily || symbolsToFetch.length <= BUNDLE_CHUNK_SIZE
 
   if (useSingleRequest) {
     const payload = await postMarketBundle({
-      symbols: request.symbols,
+      symbols: symbolsToFetch,
       intradayDate: request.intradayDate,
       intradaySymbols: request.intradaySymbols,
       skipDaily: request.skipDaily ?? false,
@@ -287,34 +442,46 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
         writeSessionCache(intradayKey, { histories: {}, intraday: payload.intraday })
       }
 
-      const cachedDaily = readCachedDaily(dailyKey)
       const result = {
-        histories: new Map(Object.entries(cachedDaily?.data.histories ?? {})),
+        histories: cachedHistories,
         intraday: new Map(Object.entries(payload.intraday)),
       }
       onProgress?.(result)
       return result
     }
 
-    writeDailyCache(dailyKey, { histories: payload.histories, intraday: {} })
+    const histories = new Map(cachedHistories)
+    for (const [symbol, history] of Object.entries(payload.histories)) {
+      histories.set(symbol, history)
+    }
+
+    const cachePayload = {
+      histories: Object.fromEntries(histories),
+      intraday: {},
+    }
+    persistBundleProgress(requestedSymbols, dailyKey, cachePayload)
     if (intradayKey && request.intradayDate) {
       writeSessionCache(intradayKey, { histories: {}, intraday: payload.intraday })
     }
 
-    const result = mapsFromCache(payload)
+    const result = { histories, intraday: new Map() }
     onProgress?.(result)
     return result
   }
 
-  const chunks = chunkSymbols(request.symbols)
+  const chunks = chunkSymbols(symbolsToFetch)
   const mergedHistories: Record<string, SymbolHistory> = {}
   const mergedIntraday: Record<string, SymbolHistory> = {}
   let completedChunks = 0
   const existingDaily = readCachedDaily(dailyKey)?.data
 
-  if (existingDaily) {
-    Object.assign(mergedHistories, existingDaily.histories)
-    Object.assign(mergedIntraday, existingDaily.intraday)
+  seedBundleFromCaches(requestedSymbols, dailyKey, mergedHistories, mergedIntraday)
+
+  if (Object.keys(mergedHistories).length > 0) {
+    onProgress?.({
+      histories: new Map(Object.entries(mergedHistories)),
+      intraday: new Map(Object.entries(mergedIntraday)),
+    })
   }
 
   for (const symbols of chunks) {
@@ -327,6 +494,12 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
           histories: new Map(Object.entries(mergedHistories)),
           intraday: new Map(Object.entries(mergedIntraday)),
         })
+        persistBundleProgress(
+          requestedSymbols,
+          dailyKey,
+          { histories: mergedHistories, intraday: mergedIntraday },
+          existingDaily,
+        )
         break
       } catch {
         if (attempt === 1) {
@@ -336,22 +509,14 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
     }
   }
 
-  if (completedChunks === 0) {
+  if (completedChunks === 0 && Object.keys(mergedHistories).length === 0) {
     throw new Error('Market bundle request failed')
   }
 
-  const cachePayload: MarketBundleCache = {
-    histories: mergedHistories,
-    intraday: mergedIntraday,
+  const result = {
+    histories: new Map(Object.entries(mergedHistories)),
+    intraday: new Map(Object.entries(mergedIntraday)),
   }
-
-  if (bundleCoverage(request.symbols, cachePayload) >= MIN_BUNDLE_COVERAGE) {
-    writeDailyCache(dailyKey, cachePayload)
-  } else if (existingDaily) {
-    writeDailyCache(dailyKey, mergeBundleCaches(existingDaily, cachePayload))
-  }
-
-  const result = mapsFromCache(cachePayload)
   onProgress?.(result)
   return result
 }
@@ -363,20 +528,36 @@ async function fetchChunkedBundle(
   onProgress?: MarketBundleProgress,
   options?: { force?: boolean },
 ): Promise<MarketBundleResult> {
+  const cachedHistories = readSymbolHistories(symbols)
+  if (cachedHistories.size > 0) {
+    onProgress?.({ histories: cachedHistories, intraday: new Map() })
+  }
+
   if (!options?.force) {
     const cached = readCachedDaily(cacheKey)
     if (cached) {
-      const result = mapsFromCache(cached.data)
-      onProgress?.(result)
-      const coverage = bundleCoverage(symbols, cached.data)
+      const merged = new Map(cachedHistories)
+      for (const [symbol, history] of Object.entries(cached.data.histories)) {
+        merged.set(symbol, history)
+      }
+      onProgress?.({ histories: merged, intraday: new Map() })
+      const coverage = bundleCoverage(symbols, {
+        histories: Object.fromEntries(merged),
+        intraday: {},
+      })
       if (cached.fresh && coverage >= minCoverage) {
-        return result
+        return { histories: merged, intraday: new Map() }
       }
     }
   }
 
-  const chunks = chunkSymbols(symbols)
-  const mergedHistories: Record<string, SymbolHistory> = {}
+  const symbolsToFetch = symbolsNeedingFetch(symbols, options?.force)
+  if (symbolsToFetch.length === 0) {
+    return { histories: cachedHistories, intraday: new Map() }
+  }
+
+  const chunks = chunkSymbols(symbolsToFetch)
+  const mergedHistories: Record<string, SymbolHistory> = Object.fromEntries(cachedHistories)
   let completedChunks = 0
 
   for (const chunk of chunks) {
@@ -389,6 +570,7 @@ async function fetchChunkedBundle(
           histories: new Map(Object.entries(mergedHistories)),
           intraday: new Map(),
         })
+        persistBundleProgress(symbols, cacheKey, { histories: mergedHistories, intraday: {} })
         break
       } catch {
         if (attempt === 1) {
@@ -398,16 +580,14 @@ async function fetchChunkedBundle(
     }
   }
 
-  if (completedChunks === 0) {
+  if (completedChunks === 0 && Object.keys(mergedHistories).length === 0) {
     throw new Error('Market bundle request failed')
   }
 
-  const cachePayload: MarketBundleCache = { histories: mergedHistories, intraday: {} }
-  if (bundleCoverage(symbols, cachePayload) >= minCoverage) {
-    writeDailyCache(cacheKey, cachePayload)
+  const result = {
+    histories: new Map(Object.entries(mergedHistories)),
+    intraday: new Map(),
   }
-
-  const result = mapsFromCache(cachePayload)
   onProgress?.(result)
   return result
 }
@@ -442,6 +622,25 @@ export async function fetchUsEquityBundle(
 ) {
   const symbols = collectUsEquityPrioritySymbols()
   return fetchChunkedBundle(symbols, US_EQUITY_BUNDLE_CACHE_KEY, 0.9, onProgress, options)
+}
+
+export function hydrateFixedIncomeCache(): MarketBundleResult | null {
+  const symbols = collectFixedIncomeSymbols()
+  const histories = readSymbolHistories(symbols)
+  if (histories.size === 0) {
+    return null
+  }
+
+  return { histories, intraday: new Map() }
+}
+
+/** Rates, sovereign yields, and bond ETFs — fetched before the long explorer queue. */
+export async function fetchFixedIncomeBundle(
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean },
+) {
+  const symbols = collectFixedIncomeSymbols()
+  return fetchChunkedBundle(symbols, FIXED_INCOME_BUNDLE_CACHE_KEY, 0.85, onProgress, options)
 }
 
 /** Dedicated fetch for the global equity map — sequential chunks, isolated cache. */

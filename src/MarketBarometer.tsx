@@ -50,10 +50,12 @@ import {
   fetchMarketBundle,
   fetchLiveHeadlines,
   fetchCountryMapBundle,
+  fetchFixedIncomeBundle,
   fetchPinnedBundle,
   fetchUsEquityBundle,
   hydrateMarketCache,
   hydrateCountryMapCache,
+  hydrateFixedIncomeCache,
   hydratePinnedCache,
   hydrateUsEquityCache,
   formatCompactChange,
@@ -220,6 +222,7 @@ function MarketBarometer() {
   const remainderSymbols = useMemo(() => {
     const skip = new Set([
       ...collectUsEquityPrioritySymbols(),
+      ...collectFixedIncomeSymbols(),
       ...collectCountryIndexSymbols(),
       ...pinnedSymbolList,
     ])
@@ -265,8 +268,15 @@ function MarketBarometer() {
         market: options?.force || current.market !== 'live' ? 'loading' : 'live',
       }))
 
+      let receivedData = false
+      const onHistoryProgress: typeof mergeMarketBundle = (bundle) => {
+        if (bundle.histories.size > 0 || bundle.intraday.size > 0) {
+          receivedData = true
+        }
+        mergeMarketBundle(bundle)
+      }
+
       const customMarketPromise = marketFeedUrl ? fetchRemoteFeed(marketFeedUrl) : Promise.resolve(null)
-      const onHistoryProgress = mergeMarketBundle
 
       const historyPromise = options?.intradayDate
         ? fetchMarketBundle(
@@ -281,74 +291,71 @@ function MarketBarometer() {
           )
         : fetchMarketBundle({ symbols: remainderSymbols, force: options?.force }, onHistoryProgress)
 
+      if (!options?.intradayDate) {
+        void historyPromise.catch(() => {
+          // Explorer symbols keep loading in the background via onHistoryProgress.
+        })
+      }
+
       const usEquityPromise = fetchUsEquityBundle(onHistoryProgress, { force: options?.force })
+      const fixedIncomePromise = fetchFixedIncomeBundle(onHistoryProgress, { force: options?.force })
       const pinnedPromise =
         pinnedSymbolList.length > 0
           ? fetchPinnedBundle(pinnedSymbolList, onHistoryProgress, { force: options?.force })
           : Promise.resolve({ histories: new Map<string, SymbolHistory>(), intraday: new Map<string, SymbolHistory>() })
       const mapPromise = fetchCountryMapBundle(onHistoryProgress, { force: options?.force })
 
-      const [customMarketResult, usEquityResult, pinnedResult, historyResult, mapResult] = await Promise.allSettled([
+      const priorityResults = await Promise.allSettled([
         customMarketPromise,
         usEquityPromise,
+        fixedIncomePromise,
         pinnedPromise,
-        historyPromise,
         mapPromise,
+        ...(options?.intradayDate ? [historyPromise] : []),
       ])
 
-      let marketStatus: FeedStatus = 'fallback'
-      const mergedHistories = new Map<string, SymbolHistory>()
-      const mergedIntraday = new Map<string, SymbolHistory>()
+      let marketStatus: FeedStatus = receivedData ? 'live' : 'loading'
 
-      const absorbBundle = (bundle?: { histories: Map<string, SymbolHistory>; intraday: Map<string, SymbolHistory> }) => {
-        if (!bundle) {
-          return
-        }
-
-        bundle.histories.forEach((history, symbol) => mergedHistories.set(symbol, history))
-        bundle.intraday.forEach((history, symbol) => mergedIntraday.set(symbol, history))
-      }
-
-      if (usEquityResult.status === 'fulfilled') {
-        absorbBundle(usEquityResult.value)
-      }
-
-      if (pinnedResult.status === 'fulfilled') {
-        absorbBundle(pinnedResult.value)
-      }
-
-      if (historyResult.status === 'fulfilled') {
-        absorbBundle(historyResult.value)
-      }
-
-      if (mapResult.status === 'fulfilled') {
-        absorbBundle(mapResult.value)
-      }
-
-      if (mergedHistories.size > 0 || mergedIntraday.size > 0) {
-        setHistories(mergedHistories)
-        if (mergedIntraday.size > 0) {
-          setIntraday(mergedIntraday)
-          if (options?.intradayDate) {
-            setIntradayDate(options.intradayDate)
+      if (!receivedData) {
+        const anyPriorityData = priorityResults.some((result) => {
+          if (result.status !== 'fulfilled' || result.value == null) {
+            return false
           }
+
+          const bundle = result.value as { histories?: Map<string, SymbolHistory> }
+          return bundle.histories != null && bundle.histories.size > 0
+        })
+        if (anyPriorityData) {
+          marketStatus = 'live'
+        } else if (priorityResults.every((result) => result.status === 'rejected')) {
+          marketStatus = 'error'
+        } else {
+          marketStatus = 'fallback'
         }
-        marketStatus = 'live'
-      } else if (
-        historyResult.status === 'rejected' &&
-        mapResult.status === 'rejected' &&
-        usEquityResult.status === 'rejected'
-      ) {
-        setHistories(new Map())
-        marketStatus = 'error'
-      } else {
-        setHistories(new Map())
-        marketStatus = 'fallback'
       }
 
+      const customMarketResult = priorityResults[0]
       if (customMarketResult.status === 'fulfilled' && customMarketResult.value) {
         setCustomMarketFeed(normalizeMarketFeed(customMarketResult.value))
         marketStatus = 'live'
+      }
+
+      if (!options?.intradayDate) {
+        void historyPromise
+          .then((bundle) => {
+            if (bundle.histories.size > 0 || bundle.intraday.size > 0) {
+              mergeMarketBundle(bundle)
+              setFeedStatus((current) => ({ ...current, market: 'live' }))
+            }
+          })
+          .catch(() => {
+            // Partial explorer data may already be on screen.
+          })
+      } else {
+        const historyResult = priorityResults[5]
+        if (historyResult?.status === 'fulfilled' && historyResult.value.intraday.size > 0) {
+          setIntradayDate(options.intradayDate)
+        }
       }
 
       setFeedStatus((current) => ({ ...current, market: marketStatus }))
@@ -426,6 +433,11 @@ function MarketBarometer() {
     const pinnedCached = hydratePinnedCache(pinnedSymbolList)
     if (pinnedCached) {
       mergeMarketBundle(pinnedCached)
+    }
+
+    const fixedIncomeCached = hydrateFixedIncomeCache()
+    if (fixedIncomeCached) {
+      mergeMarketBundle(fixedIncomeCached)
     }
 
     const mapCached = hydrateCountryMapCache()
@@ -549,6 +561,19 @@ function MarketBarometer() {
 
     setActiveMarketGroup(activeSection.groups?.[0] ?? null)
   }, [activeSection?.title, activeSection?.groups])
+
+  useEffect(() => {
+    if (!activeSection) {
+      return
+    }
+
+    const symbols = collectSymbols(activeSection.items)
+    if (symbols.length === 0) {
+      return
+    }
+
+    void fetchMarketBundle({ symbols }, mergeMarketBundle)
+  }, [activeSection?.title, mergeMarketBundle])
 
   const treasuryCurve = useMemo<CurvePoint[]>(() => {
     return treasuryCurveSymbols
