@@ -3,6 +3,7 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
 } from 'react'
@@ -481,6 +482,63 @@ function MarketBarometer() {
       cancelled = true
     }
   }, [timeMode, snapshotDate, histories, intradaySymbolList, intradayDate])
+
+  const historiesRef = useRef(histories)
+  useEffect(() => {
+    historiesRef.current = histories
+  }, [histories])
+
+  // Keep retrying any instrument that still has no live history until every one is covered.
+  useEffect(() => {
+    let cancelled = false
+    const failureCounts = new Map<string, number>()
+    const MAX_ATTEMPTS_PER_SYMBOL = 5
+
+    const run = async () => {
+      while (!cancelled) {
+        const have = historiesRef.current
+        const missing = allSymbols.filter(
+          (symbol) =>
+            !have.has(symbol) && (failureCounts.get(symbol) ?? 0) < MAX_ATTEMPTS_PER_SYMBOL,
+        )
+
+        if (missing.length === 0) {
+          return
+        }
+
+        try {
+          const bundle = await fetchMarketBundle({ symbols: missing }, mergeMarketBundle)
+          if (cancelled) {
+            return
+          }
+          for (const symbol of missing) {
+            if (!bundle.histories.has(symbol)) {
+              failureCounts.set(symbol, (failureCounts.get(symbol) ?? 0) + 1)
+            }
+          }
+        } catch {
+          for (const symbol of missing) {
+            failureCounts.set(symbol, (failureCounts.get(symbol) ?? 0) + 1)
+          }
+        }
+
+        if (cancelled) {
+          return
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 2500))
+      }
+    }
+
+    const starter = setTimeout(() => {
+      void run()
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      clearTimeout(starter)
+    }
+  }, [allSymbols, mergeMarketBundle])
 
   const snapshotDateMs = useMemo(() => {
     const parsed = new Date(`${snapshotDate}T23:59:59`)
