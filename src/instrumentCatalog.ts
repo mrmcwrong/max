@@ -115,6 +115,17 @@ export function collectBarometerSymbols() {
   ]
 }
 
+/** Summary belt, US style box, and treasury curve — fetched first on Netlify (10s limit). */
+export function collectUsEquityPrioritySymbols() {
+  return [
+    ...new Set([
+      ...Object.values(summarySymbols),
+      ...usStyleBarometerCells.map((cell) => cell.symbol),
+      ...treasuryCurveSymbols.map((point) => point.symbol),
+    ]),
+  ]
+}
+
 const FIXED_INCOME_SECTIONS = new Set([
   'Rates and Treasury yields',
   'Central bank policy rates',

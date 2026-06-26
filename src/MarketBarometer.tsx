@@ -11,6 +11,7 @@ import {
   collectCountryIndexSymbols,
   collectFixedIncomeSymbols,
   collectSymbols,
+  collectUsEquityPrioritySymbols,
   fallbackHeadlines,
   frameLabels,
   frameWeights,
@@ -26,7 +27,7 @@ import {
   type TimeFrame,
   type Unit,
 } from './instrumentCatalog'
-import { OverviewBoard, NewsModeToggle, PrintBarometerBlock, ensureWorldAtlasReady } from './MarketBarometers'
+import { OverviewBoard, NewsModeToggle, NewsCategoryFilter, PrintBarometerBlock, ensureWorldAtlasReady, filterHeadlinesByCategory } from './MarketBarometers'
 import SettingsPage from './SettingsPage'
 import { applyDeviceTheme } from './applyDeviceTheme'
 import {
@@ -49,8 +50,10 @@ import {
   fetchMarketBundle,
   fetchLiveHeadlines,
   fetchCountryMapBundle,
+  fetchUsEquityBundle,
   hydrateMarketCache,
   hydrateCountryMapCache,
+  hydrateUsEquityCache,
   formatCompactChange,
   formatDisplaySymbol,
   getNowEst,
@@ -138,7 +141,7 @@ const MARKET_NAV_CLUSTERS: Array<{ id: string; label: string; sections: string[]
   },
   {
     id: 'other',
-    label: 'FX & real assets',
+    label: 'Exchange rates & real assets',
     sections: ['Currencies and exchange rates', 'Commodities', 'Crypto'],
   },
 ]
@@ -154,7 +157,7 @@ const SECTION_SHORT_LABELS: Record<string, string> = {
   'Global 10-year sovereign yields': 'Global 10Y',
   'Bonds and credit': 'Credit',
   'Global bond ETFs': 'Bond ETFs',
-  'Currencies and exchange rates': 'FX',
+  'Currencies and exchange rates': 'Exchange Rates',
   Commodities: 'Commodities',
   Crypto: 'Crypto',
 }
@@ -178,6 +181,7 @@ function MarketBarometer() {
   const [liveHeadlines, setLiveHeadlines] = useState<Headline[]>([])
   const [breakingHeadlines, setBreakingHeadlines] = useState<Headline[]>([])
   const [breakingNews, setBreakingNews] = useState(true)
+  const [newsCategoryFilter, setNewsCategoryFilter] = useState<string[]>([])
   const [feedStatus, setFeedStatus] = useState<{ market: FeedStatus; news: FeedStatus }>({
     market: 'loading',
     news: 'loading',
@@ -203,20 +207,19 @@ function MarketBarometer() {
   )
 
   const orderedSymbols = useMemo(() => {
+    const usPriority = collectUsEquityPrioritySymbols()
     const countryIndexes = collectCountryIndexSymbols()
-    const barometer = collectBarometerSymbols()
     const fixedIncome = collectFixedIncomeSymbols()
-    const head = [
-      ...Object.values(summarySymbols),
-      ...countryIndexes,
-      ...treasuryCurveSymbols.map((point) => point.symbol),
-      ...barometer,
-      ...fixedIncome,
-    ]
+    const head = [...usPriority, ...fixedIncome, ...countryIndexes]
     const headSet = new Set(head)
     const remainder = allSymbols.filter((symbol) => !headSet.has(symbol))
     return [...head, ...remainder]
   }, [allSymbols])
+
+  const remainderSymbols = useMemo(() => {
+    const skip = new Set([...collectUsEquityPrioritySymbols(), ...collectCountryIndexSymbols()])
+    return orderedSymbols.filter((symbol) => !skip.has(symbol))
+  }, [orderedSymbols])
 
   const intradaySymbolList = useMemo(
     () => [
@@ -263,7 +266,7 @@ function MarketBarometer() {
       const historyPromise = options?.intradayDate
         ? fetchMarketBundle(
             {
-              symbols: orderedSymbols,
+              symbols: remainderSymbols,
               intradayDate: options.intradayDate,
               intradaySymbols: intradaySymbolList,
               skipDaily: true,
@@ -271,12 +274,14 @@ function MarketBarometer() {
             },
             onHistoryProgress,
           )
-        : fetchMarketBundle({ symbols: orderedSymbols, force: options?.force }, onHistoryProgress)
+        : fetchMarketBundle({ symbols: remainderSymbols, force: options?.force }, onHistoryProgress)
 
+      const usEquityPromise = fetchUsEquityBundle(onHistoryProgress, { force: options?.force })
       const mapPromise = fetchCountryMapBundle(onHistoryProgress, { force: options?.force })
 
-      const [customMarketResult, historyResult, mapResult] = await Promise.allSettled([
+      const [customMarketResult, usEquityResult, historyResult, mapResult] = await Promise.allSettled([
         customMarketPromise,
+        usEquityPromise,
         historyPromise,
         mapPromise,
       ])
@@ -292,6 +297,10 @@ function MarketBarometer() {
 
         bundle.histories.forEach((history, symbol) => mergedHistories.set(symbol, history))
         bundle.intraday.forEach((history, symbol) => mergedIntraday.set(symbol, history))
+      }
+
+      if (usEquityResult.status === 'fulfilled') {
+        absorbBundle(usEquityResult.value)
       }
 
       if (historyResult.status === 'fulfilled') {
@@ -311,7 +320,11 @@ function MarketBarometer() {
           }
         }
         marketStatus = 'live'
-      } else if (historyResult.status === 'rejected' && mapResult.status === 'rejected') {
+      } else if (
+        historyResult.status === 'rejected' &&
+        mapResult.status === 'rejected' &&
+        usEquityResult.status === 'rejected'
+      ) {
         setHistories(new Map())
         marketStatus = 'error'
       } else {
@@ -326,7 +339,7 @@ function MarketBarometer() {
 
       setFeedStatus((current) => ({ ...current, market: marketStatus }))
     },
-    [orderedSymbols, intradaySymbolList, mergeMarketBundle],
+    [remainderSymbols, intradaySymbolList, mergeMarketBundle],
   )
 
   const loadNews = useCallback(async (date: string, time: string) => {
@@ -389,6 +402,11 @@ function MarketBarometer() {
     const cached = hydrateMarketCache(orderedSymbols)
     if (cached) {
       mergeMarketBundle(cached)
+    }
+
+    const usCached = hydrateUsEquityCache()
+    if (usCached) {
+      mergeMarketBundle(usCached)
     }
 
     const mapCached = hydrateCountryMapCache()
@@ -468,6 +486,28 @@ function MarketBarometer() {
     return headlineItems
   }, [breakingNews, breakingHeadlines, headlineItems])
 
+  const newsCategories = useMemo(
+    () => [...new Set(activeHeadlines.map((headline) => headline.category))].sort((a, b) => a.localeCompare(b)),
+    [activeHeadlines],
+  )
+
+  const filteredHeadlines = useMemo(
+    () => filterHeadlinesByCategory(activeHeadlines, newsCategoryFilter),
+    [activeHeadlines, newsCategoryFilter],
+  )
+
+  useEffect(() => {
+    if (newsCategoryFilter.length === 0) {
+      return
+    }
+
+    const available = new Set(newsCategories)
+    const pruned = newsCategoryFilter.filter((category) => available.has(category))
+    if (pruned.length !== newsCategoryFilter.length) {
+      setNewsCategoryFilter(pruned)
+    }
+  }, [newsCategories, newsCategoryFilter])
+
   const sections = useMemo(
     () =>
       sectionDefinitions.map((section) => ({
@@ -479,7 +519,7 @@ function MarketBarometer() {
     [liveQuotes, marketLookup, snapshotSeed, timeFrame],
   ) as ResolvedSection[]
 
-  const topHeadlines = activeHeadlines.slice(0, 4)
+  const topHeadlines = filteredHeadlines.slice(0, 4)
 
   const tenYearQuote = liveQuotes.get(summarySymbols.tenYear)
   const twoYearQuote = liveQuotes.get(summarySymbols.twoYear)
@@ -610,7 +650,7 @@ function MarketBarometer() {
       sections: orderedSections,
       overviewRows: buildOverviewExportRows(liveQuotes),
       treasuryCurve,
-      headlines: activeHeadlines,
+      headlines: filteredHeadlines,
       pinnedTickers: deviceSettings.pinnedTickers,
       liveQuotes,
     }),
@@ -625,6 +665,8 @@ function MarketBarometer() {
       liveQuotes,
       treasuryCurve,
       activeHeadlines,
+      filteredHeadlines,
+      newsCategoryFilter,
       deviceSettings.pinnedTickers,
     ],
   )
@@ -657,11 +699,13 @@ function MarketBarometer() {
   if (view === 'headlines') {
     return (
       <HeadlinesPage
-        snapshotHeadlines={headlineItems}
-        breakingHeadlines={breakingHeadlines}
         breakingNews={breakingNews}
         breakingAvailable={breakingHeadlines.length > 0}
         onBreakingNewsChange={setBreakingNews}
+        newsCategories={newsCategories}
+        selectedNewsCategories={newsCategoryFilter}
+        onSelectedNewsCategoriesChange={setNewsCategoryFilter}
+        filteredHeadlines={filteredHeadlines}
         onBack={() => setView('dashboard')}
       />
     )
@@ -808,6 +852,9 @@ function MarketBarometer() {
           breakingNews={breakingNews}
           onBreakingNewsChange={setBreakingNews}
           breakingAvailable={breakingHeadlines.length > 0}
+          newsCategories={newsCategories}
+          selectedNewsCategories={newsCategoryFilter}
+          onSelectedNewsCategoriesChange={setNewsCategoryFilter}
           onMoreHeadlines={() => setView('headlines')}
           renderHeadline={(headline) => <HeadlineLink headline={headline} compact />}
         />
@@ -832,7 +879,7 @@ function MarketBarometer() {
         snapshotDate={snapshotDate}
         snapshotTimeLabel={snapshotTimeLabel}
         stats={stats}
-        headlines={activeHeadlines.slice(0, 6)}
+        headlines={filteredHeadlines.slice(0, 6)}
         sections={orderedSections}
         treasuryCurve={treasuryCurve}
         curveDomain={curveDomain}
@@ -843,23 +890,24 @@ function MarketBarometer() {
 }
 
 function HeadlinesPage({
-  snapshotHeadlines,
-  breakingHeadlines,
   breakingNews,
   breakingAvailable,
   onBreakingNewsChange,
+  newsCategories,
+  selectedNewsCategories,
+  onSelectedNewsCategoriesChange,
+  filteredHeadlines,
   onBack,
 }: {
-  snapshotHeadlines: Headline[]
-  breakingHeadlines: Headline[]
   breakingNews: boolean
   breakingAvailable: boolean
   onBreakingNewsChange: (enabled: boolean) => void
+  newsCategories: string[]
+  selectedNewsCategories: string[]
+  onSelectedNewsCategoriesChange: (categories: string[]) => void
+  filteredHeadlines: Headline[]
   onBack: () => void
 }) {
-  const headlines =
-    breakingNews && breakingHeadlines.length > 0 ? breakingHeadlines : snapshotHeadlines
-
   return (
     <main className="page-shell">
       <header className="headlines-page__header">
@@ -876,18 +924,29 @@ function HeadlinesPage({
                 : 'Headlines ranked for your selected snapshot date and time. Click any item to read the source.'}
             </p>
           </div>
-          <NewsModeToggle
-            breakingNews={breakingNews}
-            breakingAvailable={breakingAvailable}
-            onBreakingNewsChange={onBreakingNewsChange}
-          />
+          <div className="headlines-page__controls">
+            <NewsModeToggle
+              breakingNews={breakingNews}
+              breakingAvailable={breakingAvailable}
+              onBreakingNewsChange={onBreakingNewsChange}
+            />
+            <NewsCategoryFilter
+              categories={newsCategories}
+              selectedCategories={selectedNewsCategories}
+              onSelectedCategoriesChange={onSelectedNewsCategoriesChange}
+            />
+          </div>
         </div>
       </header>
 
       <section className="headlines-page__grid">
-        {headlines.map((headline) => (
-          <HeadlineLink key={`${headline.category}-${headline.title}`} headline={headline} />
-        ))}
+        {filteredHeadlines.length > 0 ? (
+          filteredHeadlines.map((headline) => (
+            <HeadlineLink key={`${headline.category}-${headline.title}`} headline={headline} />
+          ))
+        ) : (
+          <p className="headlines-page__empty">No headlines match the selected categories.</p>
+        )}
       </section>
     </main>
   )

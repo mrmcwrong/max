@@ -7,7 +7,9 @@ const USER_AGENT =
 
 const DAILY_CACHE_TTL_MS = 5 * 60 * 1000
 const INTRADAY_CACHE_TTL_MS = 120_000
-const FETCH_CONCURRENCY = 18
+const FETCH_CONCURRENCY = 12
+/** Return partial results before Netlify's hard kill (10s on free tier). */
+const FUNCTION_BUDGET_MS = 8_500
 
 const LONG_HISTORY_SYMBOLS = new Set(['^IRX', '2YY=F', '^FVX', '^TNX', '^TYX'])
 
@@ -199,12 +201,18 @@ async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
   worker: (item: T) => Promise<R>,
+  deadlineMs = Number.POSITIVE_INFINITY,
 ): Promise<R[]> {
   const results: R[] = new Array(items.length)
   let cursor = 0
+  const deadline = Date.now() + deadlineMs
 
   async function run() {
     while (cursor < items.length) {
+      if (Date.now() >= deadline) {
+        return
+      }
+
       const index = cursor
       cursor += 1
       results[index] = await worker(items[index])
@@ -223,10 +231,15 @@ export async function buildMarketBundle(request: BundleRequest): Promise<BundleR
   const intraday: Record<string, SymbolHistory> = {}
 
   if (!request.skipDaily && symbols.length > 0) {
-    const dailyResults = await mapWithConcurrency(symbols, FETCH_CONCURRENCY, async (symbol) => ({
-      symbol,
-      history: await fetchDailyHistory(symbol),
-    }))
+    const dailyResults = await mapWithConcurrency(
+      symbols,
+      FETCH_CONCURRENCY,
+      async (symbol) => ({
+        symbol,
+        history: await fetchDailyHistory(symbol),
+      }),
+      FUNCTION_BUDGET_MS,
+    )
 
     for (const { symbol, history } of dailyResults) {
       if (history) {

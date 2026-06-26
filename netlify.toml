@@ -6,8 +6,9 @@
 [functions]
   node_bundler = "esbuild"
 
+# Free tier hard-caps at 10s; Pro+ can raise this (e.g. 26).
 [functions."market-bundle"]
-  timeout = 26
+  timeout = 10
 
 # API proxies (must come before the SPA catch-all)
 [[redirects]]

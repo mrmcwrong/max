@@ -1,4 +1,4 @@
-import type { TimeFrame, Unit } from './instrumentCatalog'
+import { collectUsEquityPrioritySymbols, type TimeFrame, type Unit } from './instrumentCatalog'
 import { collectCountryIndexSymbols } from './barometer/countryIndexCatalog'
 
 export type TimeMode = 'open' | 'close' | 'custom'
@@ -36,9 +36,10 @@ const frameLookback: Record<TimeFrame, number> = {
 const DAY_MS = 24 * 60 * 60 * 1000
 const SESSION_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_CACHE_TTL_MS = 4 * 60 * 60 * 1000
-const BUNDLE_CHUNK_SIZE = 50
+const BUNDLE_CHUNK_SIZE = 18
 const LOCAL_CACHE_PREFIX = 'max:local:daily:v2:'
 const MAP_BUNDLE_CACHE_KEY = 'max:map:daily:v1:country-indexes'
+const US_EQUITY_BUNDLE_CACHE_KEY = 'max:us-equity:daily:v1:priority'
 const MIN_BUNDLE_COVERAGE = 0.88
 const MIN_MAP_COVERAGE = 0.85
 
@@ -153,6 +154,15 @@ export function hydrateMarketCache(symbols: string[]): MarketBundleResult | null
 
 export function hydrateCountryMapCache(): MarketBundleResult | null {
   const cached = readCachedDaily(MAP_BUNDLE_CACHE_KEY)
+  if (!cached) {
+    return null
+  }
+
+  return mapsFromCache(cached.data)
+}
+
+export function hydrateUsEquityCache(): MarketBundleResult | null {
+  const cached = readCachedDaily(US_EQUITY_BUNDLE_CACHE_KEY)
   if (!cached) {
     return null
   }
@@ -299,26 +309,24 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
     Object.assign(mergedIntraday, existingDaily.intraday)
   }
 
-  await Promise.all(
-    chunks.map(async (symbols) => {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          const payload = await postMarketBundle({ symbols, skipDaily: false })
-          Object.assign(mergedHistories, payload.histories)
-          completedChunks += 1
-          onProgress?.({
-            histories: new Map(Object.entries(mergedHistories)),
-            intraday: new Map(Object.entries(mergedIntraday)),
-          })
-          return
-        } catch {
-          if (attempt === 1) {
-            // Keep partial results from successful chunks.
-          }
+  for (const symbols of chunks) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const payload = await postMarketBundle({ symbols, skipDaily: false })
+        Object.assign(mergedHistories, payload.histories)
+        completedChunks += 1
+        onProgress?.({
+          histories: new Map(Object.entries(mergedHistories)),
+          intraday: new Map(Object.entries(mergedIntraday)),
+        })
+        break
+      } catch {
+        if (attempt === 1) {
+          // Keep partial results from successful chunks.
         }
       }
-    }),
-  )
+    }
+  }
 
   if (completedChunks === 0) {
     throw new Error('Market bundle request failed')
@@ -340,39 +348,78 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
   return result
 }
 
-/** Dedicated fetch for the global equity map — one request, isolated cache. */
-export async function fetchCountryMapBundle(
+async function fetchChunkedBundle(
+  symbols: string[],
+  cacheKey: string,
+  minCoverage: number,
   onProgress?: MarketBundleProgress,
   options?: { force?: boolean },
-) {
-  const symbols = collectCountryIndexSymbols()
-  const cacheKey = MAP_BUNDLE_CACHE_KEY
-
+): Promise<MarketBundleResult> {
   if (!options?.force) {
     const cached = readCachedDaily(cacheKey)
     if (cached) {
       const result = mapsFromCache(cached.data)
       onProgress?.(result)
       const coverage = bundleCoverage(symbols, cached.data)
-      if (cached.fresh && coverage >= MIN_MAP_COVERAGE) {
+      if (cached.fresh && coverage >= minCoverage) {
         return result
       }
     }
   }
 
-  const payload = await postMarketBundle({ symbols, skipDaily: false })
-  const cachePayload: MarketBundleCache = {
-    histories: payload.histories,
-    intraday: {},
+  const chunks = chunkSymbols(symbols)
+  const mergedHistories: Record<string, SymbolHistory> = {}
+  let completedChunks = 0
+
+  for (const chunk of chunks) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const payload = await postMarketBundle({ symbols: chunk, skipDaily: false })
+        Object.assign(mergedHistories, payload.histories)
+        completedChunks += 1
+        onProgress?.({
+          histories: new Map(Object.entries(mergedHistories)),
+          intraday: new Map(),
+        })
+        break
+      } catch {
+        if (attempt === 1) {
+          // Keep partial results from successful chunks.
+        }
+      }
+    }
   }
 
-  if (bundleCoverage(symbols, cachePayload) >= MIN_MAP_COVERAGE) {
+  if (completedChunks === 0) {
+    throw new Error('Market bundle request failed')
+  }
+
+  const cachePayload: MarketBundleCache = { histories: mergedHistories, intraday: {} }
+  if (bundleCoverage(symbols, cachePayload) >= minCoverage) {
     writeDailyCache(cacheKey, cachePayload)
   }
 
   const result = mapsFromCache(cachePayload)
   onProgress?.(result)
   return result
+}
+
+/** US summary belt, style box, and treasury — small dedicated fetch that fits Netlify's 10s cap. */
+export async function fetchUsEquityBundle(
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean },
+) {
+  const symbols = collectUsEquityPrioritySymbols()
+  return fetchChunkedBundle(symbols, US_EQUITY_BUNDLE_CACHE_KEY, 0.9, onProgress, options)
+}
+
+/** Dedicated fetch for the global equity map — sequential chunks, isolated cache. */
+export async function fetchCountryMapBundle(
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean },
+) {
+  const symbols = collectCountryIndexSymbols()
+  return fetchChunkedBundle(symbols, MAP_BUNDLE_CACHE_KEY, MIN_MAP_COVERAGE, onProgress, options)
 }
 
 export async function fetchAllHistories(symbols: string[]) {
