@@ -50,7 +50,7 @@ function performanceTone(changePct?: number) {
 
 function countryFill(changePct?: number) {
   if (changePct == null || Number.isNaN(changePct)) {
-    return 'rgba(255, 255, 255, 0.05)'
+    return 'rgba(148, 163, 184, 0.14)'
   }
 
   const intensity = Math.min(Math.abs(changePct) / 6, 1)

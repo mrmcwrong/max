@@ -1,4 +1,5 @@
 import type { TimeFrame, Unit } from './instrumentCatalog'
+import { collectCountryIndexSymbols } from './barometer/countryIndexCatalog'
 
 export type TimeMode = 'open' | 'close' | 'custom'
 
@@ -36,7 +37,10 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const SESSION_CACHE_TTL_MS = 30 * 60 * 1000
 const LOCAL_CACHE_TTL_MS = 4 * 60 * 60 * 1000
 const BUNDLE_CHUNK_SIZE = 50
-const LOCAL_CACHE_PREFIX = 'max:local:daily:v1:'
+const LOCAL_CACHE_PREFIX = 'max:local:daily:v2:'
+const MAP_BUNDLE_CACHE_KEY = 'max:map:daily:v1:country-indexes'
+const MIN_BUNDLE_COVERAGE = 0.88
+const MIN_MAP_COVERAGE = 0.85
 
 type MarketBundleRequest = {
   symbols: string[]
@@ -147,8 +151,33 @@ export function hydrateMarketCache(symbols: string[]): MarketBundleResult | null
   return mapsFromCache(cached.data)
 }
 
+export function hydrateCountryMapCache(): MarketBundleResult | null {
+  const cached = readCachedDaily(MAP_BUNDLE_CACHE_KEY)
+  if (!cached) {
+    return null
+  }
+
+  return mapsFromCache(cached.data)
+}
+
 function dailyCacheKey(symbols: string[]) {
-  return `max:daily:v6:${[...symbols].sort().join('|')}`
+  return `max:daily:v7:${[...symbols].sort().join('|')}`
+}
+
+function bundleCoverage(symbols: string[], data: MarketBundleCache) {
+  if (symbols.length === 0) {
+    return 1
+  }
+
+  const hits = symbols.filter((symbol) => data.histories[symbol]).length
+  return hits / symbols.length
+}
+
+function mergeBundleCaches(existing: MarketBundleCache, incoming: MarketBundleCache): MarketBundleCache {
+  return {
+    histories: { ...existing.histories, ...incoming.histories },
+    intraday: { ...existing.intraday, ...incoming.intraday },
+  }
 }
 
 function intradayCacheKey(date: string, symbols: string[]) {
@@ -216,7 +245,8 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
       if (cachedDaily) {
         const result = mapsFromCache(cachedDaily.data)
         onProgress?.(result)
-        if (cachedDaily.fresh) {
+        const coverage = bundleCoverage(request.symbols, cachedDaily.data)
+        if (cachedDaily.fresh && coverage >= MIN_BUNDLE_COVERAGE) {
           return result
         }
       }
@@ -262,6 +292,12 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
   const mergedHistories: Record<string, SymbolHistory> = {}
   const mergedIntraday: Record<string, SymbolHistory> = {}
   let completedChunks = 0
+  const existingDaily = readCachedDaily(dailyKey)?.data
+
+  if (existingDaily) {
+    Object.assign(mergedHistories, existingDaily.histories)
+    Object.assign(mergedIntraday, existingDaily.intraday)
+  }
 
   await Promise.all(
     chunks.map(async (symbols) => {
@@ -292,7 +328,47 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
     histories: mergedHistories,
     intraday: mergedIntraday,
   }
-  writeDailyCache(dailyKey, cachePayload)
+
+  if (bundleCoverage(request.symbols, cachePayload) >= MIN_BUNDLE_COVERAGE) {
+    writeDailyCache(dailyKey, cachePayload)
+  } else if (existingDaily) {
+    writeDailyCache(dailyKey, mergeBundleCaches(existingDaily, cachePayload))
+  }
+
+  const result = mapsFromCache(cachePayload)
+  onProgress?.(result)
+  return result
+}
+
+/** Dedicated fetch for the global equity map — one request, isolated cache. */
+export async function fetchCountryMapBundle(
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean },
+) {
+  const symbols = collectCountryIndexSymbols()
+  const cacheKey = MAP_BUNDLE_CACHE_KEY
+
+  if (!options?.force) {
+    const cached = readCachedDaily(cacheKey)
+    if (cached) {
+      const result = mapsFromCache(cached.data)
+      onProgress?.(result)
+      const coverage = bundleCoverage(symbols, cached.data)
+      if (cached.fresh && coverage >= MIN_MAP_COVERAGE) {
+        return result
+      }
+    }
+  }
+
+  const payload = await postMarketBundle({ symbols, skipDaily: false })
+  const cachePayload: MarketBundleCache = {
+    histories: payload.histories,
+    intraday: {},
+  }
+
+  if (bundleCoverage(symbols, cachePayload) >= MIN_MAP_COVERAGE) {
+    writeDailyCache(cacheKey, cachePayload)
+  }
 
   const result = mapsFromCache(cachePayload)
   onProgress?.(result)

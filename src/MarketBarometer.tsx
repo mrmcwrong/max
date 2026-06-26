@@ -8,6 +8,7 @@ import {
 } from 'react'
 import {
   collectBarometerSymbols,
+  collectCountryIndexSymbols,
   collectFixedIncomeSymbols,
   collectSymbols,
   fallbackHeadlines,
@@ -47,7 +48,9 @@ import {
   fetchBreakingHeadlines,
   fetchMarketBundle,
   fetchLiveHeadlines,
+  fetchCountryMapBundle,
   hydrateMarketCache,
+  hydrateCountryMapCache,
   formatCompactChange,
   formatDisplaySymbol,
   getNowEst,
@@ -200,10 +203,12 @@ function MarketBarometer() {
   )
 
   const orderedSymbols = useMemo(() => {
+    const countryIndexes = collectCountryIndexSymbols()
     const barometer = collectBarometerSymbols()
     const fixedIncome = collectFixedIncomeSymbols()
     const head = [
       ...Object.values(summarySymbols),
+      ...countryIndexes,
       ...treasuryCurveSymbols.map((point) => point.symbol),
       ...barometer,
       ...fixedIncome,
@@ -268,7 +273,13 @@ function MarketBarometer() {
           )
         : fetchMarketBundle({ symbols: orderedSymbols, force: options?.force }, onHistoryProgress)
 
-      const [customMarketResult, historyResult] = await Promise.allSettled([customMarketPromise, historyPromise])
+      const mapPromise = fetchCountryMapBundle(onHistoryProgress, { force: options?.force })
+
+      const [customMarketResult, historyResult, mapResult] = await Promise.allSettled([
+        customMarketPromise,
+        historyPromise,
+        mapPromise,
+      ])
 
       let marketStatus: FeedStatus = 'fallback'
       const mergedHistories = new Map<string, SymbolHistory>()
@@ -287,6 +298,10 @@ function MarketBarometer() {
         absorbBundle(historyResult.value)
       }
 
+      if (mapResult.status === 'fulfilled') {
+        absorbBundle(mapResult.value)
+      }
+
       if (mergedHistories.size > 0 || mergedIntraday.size > 0) {
         setHistories(mergedHistories)
         if (mergedIntraday.size > 0) {
@@ -296,7 +311,7 @@ function MarketBarometer() {
           }
         }
         marketStatus = 'live'
-      } else if (historyResult.status === 'rejected') {
+      } else if (historyResult.status === 'rejected' && mapResult.status === 'rejected') {
         setHistories(new Map())
         marketStatus = 'error'
       } else {
@@ -374,6 +389,11 @@ function MarketBarometer() {
     const cached = hydrateMarketCache(orderedSymbols)
     if (cached) {
       mergeMarketBundle(cached)
+    }
+
+    const mapCached = hydrateCountryMapCache()
+    if (mapCached) {
+      mergeMarketBundle(mapCached)
     }
   }, [orderedSymbols, mergeMarketBundle])
 

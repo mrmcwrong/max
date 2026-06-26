@@ -1,5 +1,7 @@
 import { collectCountryIndexSymbols } from './barometer/countryIndexCatalog'
 
+export { collectCountryIndexSymbols }
+
 export type TimeFrame = '1D' | '1W' | '1M' | '3M' | '1Y'
 export type Unit = 'index' | 'price' | 'yield' | 'fx' | 'rate'
 
