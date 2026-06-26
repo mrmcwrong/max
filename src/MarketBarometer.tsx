@@ -1,13 +1,13 @@
 import {
-  Fragment,
   useCallback,
   useEffect,
   useMemo,
   useState,
   type CSSProperties,
-  type ReactNode,
 } from 'react'
 import {
+  collectBarometerSymbols,
+  collectFixedIncomeSymbols,
   collectSymbols,
   fallbackHeadlines,
   frameLabels,
@@ -24,16 +24,18 @@ import {
   type TimeFrame,
   type Unit,
 } from './instrumentCatalog'
+import { OverviewBoard, NewsModeToggle, PrintBarometerBlock, ensureWorldAtlasReady } from './MarketBarometers'
 import {
   computeCurvePoint,
   computeIntradayQuote,
   computeQuote,
   estDateTimeToMs,
   fetchIntradayForSymbols,
+  fetchBreakingHeadlines,
   fetchMarketBundle,
   fetchLiveHeadlines,
-  formatPercentWithAmount,
-  formatSignedAmount,
+  formatCompactChange,
+  formatDisplaySymbol,
   getNowEst,
   snapshotTimeForMode,
   yahooQuoteUrl,
@@ -65,6 +67,7 @@ type StatItem = {
   value: string
   delta?: string
   tone: StatTone
+  symbol?: string
 }
 
 const marketFeedUrl = import.meta.env.VITE_MARKET_DATA_URL as string | undefined
@@ -94,6 +97,51 @@ const SECTION_ORDER = [
   'Crypto',
 ]
 
+const MARKET_NAV_CLUSTERS: Array<{ id: string; label: string; sections: string[] }> = [
+  {
+    id: 'equities',
+    label: 'Equities',
+    sections: [
+      'U.S. equity benchmarks',
+      'S&P 500 sectors',
+      'Mega-cap and AI leaders',
+      'Volatility',
+      'International equities',
+    ],
+  },
+  {
+    id: 'rates',
+    label: 'Rates',
+    sections: ['Rates and Treasury yields', 'Central bank policy rates', 'Global 10-year sovereign yields'],
+  },
+  {
+    id: 'fixed',
+    label: 'Fixed income',
+    sections: ['Bonds and credit', 'Global bond ETFs'],
+  },
+  {
+    id: 'other',
+    label: 'FX & real assets',
+    sections: ['Currencies and exchange rates', 'Commodities', 'Crypto'],
+  },
+]
+
+const SECTION_SHORT_LABELS: Record<string, string> = {
+  'U.S. equity benchmarks': 'US benchmarks',
+  'S&P 500 sectors': 'S&P sectors',
+  'Mega-cap and AI leaders': 'Mega-cap / AI',
+  Volatility: 'Volatility',
+  'International equities': 'International',
+  'Rates and Treasury yields': 'US Treasuries',
+  'Central bank policy rates': 'Policy rates',
+  'Global 10-year sovereign yields': 'Global 10Y',
+  'Bonds and credit': 'Credit',
+  'Global bond ETFs': 'Bond ETFs',
+  'Currencies and exchange rates': 'FX',
+  Commodities: 'Commodities',
+  Crypto: 'Crypto',
+}
+
 function MarketBarometer() {
   const [timeFrame, setTimeFrame] = useState<TimeFrame>('1W')
   const [snapshotDate, setSnapshotDate] = useState(() => getLastCloseDate())
@@ -101,6 +149,8 @@ function MarketBarometer() {
   const [customTime, setCustomTime] = useState('12:00')
   const [liveView, setLiveView] = useState(false)
   const [view, setView] = useState<'dashboard' | 'headlines'>('dashboard')
+  const [activeMarketSection, setActiveMarketSection] = useState(SECTION_ORDER[0])
+  const [activeMarketGroup, setActiveMarketGroup] = useState<string | null>(null)
   const [histories, setHistories] = useState<Map<string, SymbolHistory>>(new Map())
   const [intraday, setIntraday] = useState<Map<string, SymbolHistory>>(new Map())
   const [intradayDate, setIntradayDate] = useState<string | null>(null)
@@ -108,6 +158,8 @@ function MarketBarometer() {
   const [customMarketFeed, setCustomMarketFeed] = useState<RemoteMarketRow[]>([])
   const [customNewsFeed, setCustomNewsFeed] = useState<Headline[]>([])
   const [liveHeadlines, setLiveHeadlines] = useState<Headline[]>([])
+  const [breakingHeadlines, setBreakingHeadlines] = useState<Headline[]>([])
+  const [breakingNews, setBreakingNews] = useState(true)
   const [feedStatus, setFeedStatus] = useState<{ market: FeedStatus; news: FeedStatus }>({
     market: 'loading',
     news: 'loading',
@@ -119,19 +171,24 @@ function MarketBarometer() {
         ...collectSymbols(sectionDefinitions.flatMap((section) => section.items)),
         ...treasuryCurveSymbols.map((point) => point.symbol),
         ...Object.values(summarySymbols),
+        ...collectBarometerSymbols(),
       ]),
     ],
     [],
   )
 
   const orderedSymbols = useMemo(() => {
-    const priority = new Set([
+    const barometer = collectBarometerSymbols()
+    const fixedIncome = collectFixedIncomeSymbols()
+    const head = [
       ...Object.values(summarySymbols),
       ...treasuryCurveSymbols.map((point) => point.symbol),
-    ])
-    const preferred = allSymbols.filter((symbol) => priority.has(symbol))
-    const remainder = allSymbols.filter((symbol) => !priority.has(symbol))
-    return [...preferred, ...remainder]
+      ...barometer,
+      ...fixedIncome,
+    ]
+    const headSet = new Set(head)
+    const remainder = allSymbols.filter((symbol) => !headSet.has(symbol))
+    return [...head, ...remainder]
   }, [allSymbols])
 
   const intradaySymbolList = useMemo(
@@ -143,6 +200,9 @@ function MarketBarometer() {
     ],
     [],
   )
+
+  const barometerSymbolList = useMemo(() => collectBarometerSymbols(), [])
+  const fixedIncomeSymbolList = useMemo(() => collectFixedIncomeSymbols(), [])
 
   const loadFeeds = useCallback(
     async (options?: { force?: boolean; intradayDate?: string }) => {
@@ -172,33 +232,67 @@ function MarketBarometer() {
           )
         : fetchMarketBundle({ symbols: orderedSymbols, force: options?.force }, onHistoryProgress)
 
-      const [customMarketResult, historyResult] = await Promise.allSettled([
+      const barometerPromise = fetchMarketBundle(
+        { symbols: barometerSymbolList, force: options?.force },
+        onHistoryProgress,
+      )
+
+      const fixedIncomePromise = fetchMarketBundle(
+        { symbols: fixedIncomeSymbolList, force: options?.force },
+        onHistoryProgress,
+      )
+
+      const [customMarketResult, historyResult, barometerResult, fixedIncomeResult] = await Promise.allSettled([
         customMarketPromise,
         historyPromise,
+        barometerPromise,
+        fixedIncomePromise,
       ])
 
       let marketStatus: FeedStatus = 'fallback'
+      const mergedHistories = new Map<string, SymbolHistory>()
+      const mergedIntraday = new Map<string, SymbolHistory>()
+
+      const absorbBundle = (bundle?: { histories: Map<string, SymbolHistory>; intraday: Map<string, SymbolHistory> }) => {
+        if (!bundle) {
+          return
+        }
+
+        bundle.histories.forEach((history, symbol) => mergedHistories.set(symbol, history))
+        bundle.intraday.forEach((history, symbol) => mergedIntraday.set(symbol, history))
+      }
 
       if (historyResult.status === 'fulfilled') {
-        const bundle = historyResult.value
-        if (bundle.histories.size > 0 || bundle.intraday.size > 0) {
-          if (bundle.histories.size > 0) {
-            setHistories(bundle.histories)
+        absorbBundle(historyResult.value)
+      }
+
+      if (barometerResult.status === 'fulfilled') {
+        absorbBundle(barometerResult.value)
+      }
+
+      if (fixedIncomeResult.status === 'fulfilled') {
+        absorbBundle(fixedIncomeResult.value)
+      }
+
+      if (mergedHistories.size > 0 || mergedIntraday.size > 0) {
+        setHistories(mergedHistories)
+        if (mergedIntraday.size > 0) {
+          setIntraday(mergedIntraday)
+          if (options?.intradayDate) {
+            setIntradayDate(options.intradayDate)
           }
-          if (bundle.intraday.size > 0) {
-            setIntraday(bundle.intraday)
-            if (options?.intradayDate) {
-              setIntradayDate(options.intradayDate)
-            }
-          }
-          marketStatus = 'live'
-        } else {
-          setHistories(new Map())
-          marketStatus = 'fallback'
         }
-      } else {
+        marketStatus = 'live'
+      } else if (
+        historyResult.status === 'rejected' &&
+        barometerResult.status === 'rejected' &&
+        fixedIncomeResult.status === 'rejected'
+      ) {
         setHistories(new Map())
         marketStatus = 'error'
+      } else {
+        setHistories(new Map())
+        marketStatus = 'fallback'
       }
 
       if (customMarketResult.status === 'fulfilled' && customMarketResult.value) {
@@ -208,7 +302,7 @@ function MarketBarometer() {
 
       setFeedStatus((current) => ({ ...current, market: marketStatus }))
     },
-    [orderedSymbols, intradaySymbolList],
+    [orderedSymbols, intradaySymbolList, barometerSymbolList, fixedIncomeSymbolList],
   )
 
   const loadNews = useCallback(async (date: string, time: string) => {
@@ -216,8 +310,13 @@ function MarketBarometer() {
 
     const customNewsPromise = newsFeedUrl ? fetchRemoteFeed(newsFeedUrl) : Promise.resolve(null)
     const newsPromise = fetchLiveHeadlines(date, time)
+    const breakingPromise = fetchBreakingHeadlines()
 
-    const [customNewsResult, newsResult] = await Promise.allSettled([customNewsPromise, newsPromise])
+    const [customNewsResult, newsResult, breakingResult] = await Promise.allSettled([
+      customNewsPromise,
+      newsPromise,
+      breakingPromise,
+    ])
 
     let newsStatus: FeedStatus = 'fallback'
 
@@ -227,6 +326,12 @@ function MarketBarometer() {
     } else {
       setLiveHeadlines([])
       newsStatus = newsResult.status === 'rejected' ? 'error' : 'fallback'
+    }
+
+    if (breakingResult.status === 'fulfilled') {
+      setBreakingHeadlines(breakingResult.value)
+    } else {
+      setBreakingHeadlines([])
     }
 
     if (customNewsResult.status === 'fulfilled' && customNewsResult.value) {
@@ -315,6 +420,13 @@ function MarketBarometer() {
   const headlineItems =
     customNewsFeed.length > 0 ? customNewsFeed : liveHeadlines.length > 0 ? liveHeadlines : fallbackHeadlines
 
+  const activeHeadlines = useMemo(() => {
+    if (breakingNews && breakingHeadlines.length > 0) {
+      return breakingHeadlines
+    }
+    return headlineItems
+  }, [breakingNews, breakingHeadlines, headlineItems])
+
   const sections = useMemo(
     () =>
       sectionDefinitions.map((section) => ({
@@ -326,26 +438,39 @@ function MarketBarometer() {
     [liveQuotes, marketLookup, snapshotSeed, timeFrame],
   ) as ResolvedSection[]
 
-  const topHeadlines = headlineItems.slice(0, 4)
+  const topHeadlines = activeHeadlines.slice(0, 4)
 
   const tenYearQuote = liveQuotes.get(summarySymbols.tenYear)
   const twoYearQuote = liveQuotes.get(summarySymbols.twoYear)
 
   const stats: StatItem[] = [
-    indexStat('S&P 500', liveQuotes.get(summarySymbols.sp500)),
-    indexStat('Russell 2000', liveQuotes.get(summarySymbols.russell2000)),
-    indexStat('Nasdaq', liveQuotes.get(summarySymbols.nasdaq)),
-    indexStat('Dow Jones', liveQuotes.get(summarySymbols.dow)),
-    indexStat('VIX', liveQuotes.get(summarySymbols.vix)),
-    yieldStat('10Y Treasury', tenYearQuote),
-    yieldStat('2Y Treasury', twoYearQuote),
-    indexStat('DXY', liveQuotes.get(summarySymbols.dollar)),
-    priceStat('Crude Oil', liveQuotes.get(summarySymbols.crude)),
+    indexStat('S&P 500', summarySymbols.sp500, liveQuotes.get(summarySymbols.sp500)),
+    indexStat('Russell 2000', summarySymbols.russell2000, liveQuotes.get(summarySymbols.russell2000)),
+    indexStat('Nasdaq', summarySymbols.nasdaq, liveQuotes.get(summarySymbols.nasdaq)),
+    indexStat('Dow Jones', summarySymbols.dow, liveQuotes.get(summarySymbols.dow)),
+    indexStat('VIX', summarySymbols.vix, liveQuotes.get(summarySymbols.vix)),
+    yieldStat('10Y Treasury', summarySymbols.tenYear, tenYearQuote),
+    yieldStat('2Y Treasury', summarySymbols.twoYear, twoYearQuote),
+    indexStat('DXY', summarySymbols.dollar, liveQuotes.get(summarySymbols.dollar)),
+    priceStat('Crude Oil', summarySymbols.crude, liveQuotes.get(summarySymbols.crude)),
   ]
 
   const orderedSections = SECTION_ORDER.map((title) => sections.find((section) => section.title === title)).filter(
     (section): section is ResolvedSection => Boolean(section),
   )
+
+  const activeSection = useMemo(
+    () => orderedSections.find((section) => section.title === activeMarketSection) ?? orderedSections[0],
+    [orderedSections, activeMarketSection],
+  )
+
+  useEffect(() => {
+    if (!activeSection) {
+      return
+    }
+
+    setActiveMarketGroup(activeSection.groups?.[0] ?? null)
+  }, [activeSection?.title, activeSection?.groups])
 
   const treasuryCurve = useMemo<CurvePoint[]>(() => {
     return treasuryCurveSymbols
@@ -386,11 +511,22 @@ function MarketBarometer() {
         : `${formatEstTimestamp(snapshotDate, customTime)} (custom)`
 
   const handlePrint = useCallback(() => {
-    window.print()
+    void ensureWorldAtlasReady().then(() => {
+      setTimeout(() => window.print(), 120)
+    })
   }, [])
 
   if (view === 'headlines') {
-    return <HeadlinesPage headlines={headlineItems} onBack={() => setView('dashboard')} />
+    return (
+      <HeadlinesPage
+        snapshotHeadlines={headlineItems}
+        breakingHeadlines={breakingHeadlines}
+        breakingNews={breakingNews}
+        breakingAvailable={breakingHeadlines.length > 0}
+        onBreakingNewsChange={setBreakingNews}
+        onBack={() => setView('dashboard')}
+      />
+    )
   }
 
   return (
@@ -486,87 +622,91 @@ function MarketBarometer() {
         </div>
       </header>
 
-      <section className="glance">
-        <StatTicker stats={stats} />
+      <section className="overview-hub">
+        <section className="glance">
+          <StatTicker stats={stats} />
+        </section>
+
+        <OverviewBoard
+          liveQuotes={liveQuotes}
+          timeFrame={timeFrame}
+          headlines={topHeadlines}
+          breakingNews={breakingNews}
+          onBreakingNewsChange={setBreakingNews}
+          breakingAvailable={breakingHeadlines.length > 0}
+          onMoreHeadlines={() => setView('headlines')}
+          renderHeadline={(headline) => <HeadlineLink headline={headline} compact />}
+        />
       </section>
 
-      <CollapsiblePanel
-        title="Top headlines"
-        subtitle="Ranked for the snapshot date and time — Fed, earnings, macro, and trade stories that matter most right then"
-        eyebrow="News"
-        defaultOpen
-        action={
-          <button
-            type="button"
-            className="panel-link"
-            onClick={(event) => {
-              event.preventDefault()
-              event.stopPropagation()
-              setView('headlines')
-            }}
-          >
-            More headlines →
-          </button>
-        }
-      >
-        <div className="headline-grid">
-          {topHeadlines.map((headline) => (
-            <HeadlineLink key={`${headline.category}-${headline.title}`} headline={headline} />
-          ))}
-        </div>
-      </CollapsiblePanel>
-
-      {orderedSections.map((section) => (
-        <Fragment key={section.title}>
-          <CollapsibleSection section={section} />
-          {section.title === CURVE_AFTER_SECTION ? (
-            <CollapsiblePanel
-              title="U.S. Treasury yield curve"
-              subtitle="Yields across maturities — snapshot versus one month and one year prior"
-            >
-              <div className="curve-wrap">
-                <div className="curve-legend">
-                  <LegendItem label="Snapshot" tone="current" />
-                  <LegendItem label="1 month prior" tone="month" />
-                  <LegendItem label="1 year prior" tone="year" />
-                </div>
-                {treasuryCurve.length > 0 ? (
-                  <CurveChart points={treasuryCurve} domain={curveDomain} />
-                ) : (
-                  <p className="curve-footnote">Loading live treasury curve data…</p>
-                )}
-              </div>
-            </CollapsiblePanel>
-          ) : null}
-        </Fragment>
-      ))}
+      {activeSection ? (
+        <MarketsExplorer
+          sections={orderedSections}
+          activeSection={activeSection}
+          activeGroup={activeMarketGroup}
+          onSectionChange={setActiveMarketSection}
+          onGroupChange={setActiveMarketGroup}
+          treasuryCurve={treasuryCurve}
+          curveDomain={curveDomain}
+        />
+      ) : null}
       </div>
 
       <PrintReport
         timeFrameLabel={frameLabels[timeFrame]}
+        timeFrame={timeFrame}
         snapshotDate={snapshotDate}
         snapshotTimeLabel={snapshotTimeLabel}
         stats={stats}
-        headlines={topHeadlines}
+        headlines={activeHeadlines.slice(0, 6)}
         sections={orderedSections}
         treasuryCurve={treasuryCurve}
         curveDomain={curveDomain}
+        liveQuotes={liveQuotes}
       />
     </main>
   )
 }
 
-function HeadlinesPage({ headlines, onBack }: { headlines: Headline[]; onBack: () => void }) {
+function HeadlinesPage({
+  snapshotHeadlines,
+  breakingHeadlines,
+  breakingNews,
+  breakingAvailable,
+  onBreakingNewsChange,
+  onBack,
+}: {
+  snapshotHeadlines: Headline[]
+  breakingHeadlines: Headline[]
+  breakingNews: boolean
+  breakingAvailable: boolean
+  onBreakingNewsChange: (enabled: boolean) => void
+  onBack: () => void
+}) {
+  const headlines =
+    breakingNews && breakingHeadlines.length > 0 ? breakingHeadlines : snapshotHeadlines
+
   return (
     <main className="page-shell">
       <header className="headlines-page__header">
         <button type="button" className="back-button" onClick={onBack}>
           ← Back to dashboard
         </button>
-        <div>
-          <p className="eyebrow">News</p>
-          <h1>All market headlines</h1>
-          <p className="hero-text">Live economic and business headlines, newest first. Click any item to read the source.</p>
+        <div className="headlines-page__title-row">
+          <div>
+            <p className="eyebrow">News</p>
+            <h1>More market headlines</h1>
+            <p className="hero-text">
+              {breakingNews
+                ? 'Major market-moving stories from the past few hours, ranked by impact and recency.'
+                : 'Headlines ranked for your selected snapshot date and time. Click any item to read the source.'}
+            </p>
+          </div>
+          <NewsModeToggle
+            breakingNews={breakingNews}
+            breakingAvailable={breakingAvailable}
+            onBreakingNewsChange={onBreakingNewsChange}
+          />
         </div>
       </header>
 
@@ -581,6 +721,7 @@ function HeadlinesPage({ headlines, onBack }: { headlines: Headline[]; onBack: (
 
 function PrintReport({
   timeFrameLabel,
+  timeFrame,
   snapshotDate,
   snapshotTimeLabel,
   stats,
@@ -588,8 +729,10 @@ function PrintReport({
   sections,
   treasuryCurve,
   curveDomain,
+  liveQuotes,
 }: {
   timeFrameLabel: string
+  timeFrame: TimeFrame
   snapshotDate: string
   snapshotTimeLabel: string
   stats: StatItem[]
@@ -597,29 +740,35 @@ function PrintReport({
   sections: ResolvedSection[]
   treasuryCurve: CurvePoint[]
   curveDomain: { min: number; max: number }
+  liveQuotes: Map<string, ComputedQuote>
 }) {
+  const sectionByTitle = useMemo(() => new Map(sections.map((section) => [section.title, section])), [sections])
+
   return (
-    <article className="print-report" aria-hidden="true">
-      <header className="print-report__header">
-        <p className="print-report__brand">MAX</p>
-        <h1>Market Analytics Explorer</h1>
-        <dl className="print-report__meta">
+    <article className="print-report">
+      <header className="print-masthead">
+        <div className="print-masthead__brand">
+          <p className="print-masthead__eyebrow">Market Analytics Explorer</p>
+          <h1>MAX</h1>
+        </div>
+        <dl className="print-masthead__meta">
           <div>
-            <dt>Snapshot date</dt>
+            <dt>Snapshot</dt>
             <dd>{formatReportDate(snapshotDate)}</dd>
           </div>
           <div>
-            <dt>Snapshot time</dt>
+            <dt>Time</dt>
             <dd>{snapshotTimeLabel}</dd>
           </div>
           <div>
-            <dt>Time period</dt>
+            <dt>Period</dt>
             <dd>{timeFrameLabel}</dd>
           </div>
         </dl>
       </header>
 
-      <PrintReportBlock className="print-report__block--overview" head={<h2>Overview</h2>} body={
+      <section className="print-panel print-panel--overview">
+        <h2 className="print-panel__title">Market overview</h2>
         <div className="print-stat-grid">
           {stats.map((stat) => (
             <div className={`print-stat print-stat--${stat.tone}`} key={stat.label}>
@@ -629,133 +778,179 @@ function PrintReport({
             </div>
           ))}
         </div>
-      } />
+      </section>
 
-      <PrintReportBlock
-        className="print-report__block--headlines"
-        head={<h2>Top headlines</h2>}
-        body={
+      {headlines.length > 0 ? (
+        <section className="print-panel print-panel--news">
+          <h2 className="print-panel__title">Headlines</h2>
           <div className="print-headlines">
             {headlines.map((headline) => (
-              <div className="print-headline" key={`${headline.category}-${headline.title}`}>
+              <article className="print-headline" key={`${headline.category}-${headline.title}`}>
                 <p className="print-headline__category">{headline.category}</p>
                 <h3>{headline.title}</h3>
                 <p className="print-headline__detail">{headline.detail}</p>
-              </div>
+              </article>
             ))}
           </div>
-        }
-      />
+        </section>
+      ) : null}
 
-      {sections.map((section) => (
-        <Fragment key={section.title}>
-          <PrintReportSection section={section} />
-          {section.title === CURVE_AFTER_SECTION ? (
-            <PrintReportBlock
-              className="print-report__block--curve"
-              head={
-                <>
-                  <h2>U.S. Treasury yield curve</h2>
-                  <p className="print-report__lede">Snapshot date versus one month prior versus one year prior.</p>
-                </>
-              }
-              body={
-                <div className="curve-wrap">
-                  <div className="curve-legend">
-                    <LegendItem label="Snapshot" tone="current" />
-                    <LegendItem label="1 month prior" tone="month" />
-                    <LegendItem label="1 year prior" tone="year" />
-                  </div>
-                  {treasuryCurve.length > 0 ? (
-                    <CurveChart points={treasuryCurve} domain={curveDomain} />
-                  ) : (
-                    <p className="curve-footnote">Treasury curve data unavailable for this snapshot.</p>
-                  )}
-                </div>
-              }
-            />
-          ) : null}
-        </Fragment>
+      {treasuryCurve.length > 0 ? (
+        <section className="print-panel print-panel--curve">
+          <div className="print-panel__title-row">
+            <h2 className="print-panel__title">U.S. Treasury yield curve</h2>
+            <div className="print-curve-legend">
+              <span className="print-curve-legend__item print-curve-legend__item--current">Snapshot</span>
+              <span className="print-curve-legend__item print-curve-legend__item--month">1M ago</span>
+              <span className="print-curve-legend__item print-curve-legend__item--year">1Y ago</span>
+            </div>
+          </div>
+          <PrintYieldCurve points={treasuryCurve} domain={curveDomain} />
+        </section>
+      ) : null}
+
+      {MARKET_NAV_CLUSTERS.map((cluster) => (
+        <PrintClusterTable key={cluster.id} cluster={cluster} sectionByTitle={sectionByTitle} />
       ))}
+
+      <PrintBarometerBlock liveQuotes={liveQuotes} timeFrame={timeFrame} />
+
+      <footer className="print-footer">
+        <span>MAX · Market Analytics Explorer</span>
+        <span>
+          {formatReportDate(snapshotDate)} · {timeFrameLabel} · {snapshotTimeLabel}
+        </span>
+      </footer>
     </article>
   )
 }
 
-function PrintReportSection({ section }: { section: ResolvedSection }) {
-  const groupedItems: Array<{ group: string; items: InstrumentSnapshot[] }> = section.groups
-    ? section.groups.map((group) => ({
-        group,
-        items: section.items.filter((item) => item.group === group),
-      }))
-    : [{ group: section.title, items: section.items }]
-
+function PrintClusterTable({
+  cluster,
+  sectionByTitle,
+}: {
+  cluster: (typeof MARKET_NAV_CLUSTERS)[number]
+  sectionByTitle: Map<string, ResolvedSection>
+}) {
   return (
-    <PrintReportBlock
-      className="print-report__block--section"
-      head={
-        <>
-          <h2>{section.title}</h2>
-          <p className="print-report__lede">{section.subtitle}</p>
-        </>
-      }
-      body={
-        <>
-          {groupedItems.map(({ group, items }) => (
-            <div className="print-report__group" key={group}>
-              {section.groups ? (
-                <div className="print-report__group-head">
-                  <h3>{group}</h3>
-                </div>
-              ) : null}
-              <table className="print-table print-table--instruments">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Symbol</th>
-                    <th>Value</th>
-                    <th>Change</th>
+    <section className={`print-cluster print-cluster--${cluster.id}`}>
+      <table className="print-market-table">
+        <caption className="print-cluster__banner">{cluster.label}</caption>
+        <thead>
+          <tr>
+            <th>Instrument</th>
+            <th>Sym</th>
+            <th>Value</th>
+            <th>Change</th>
+          </tr>
+        </thead>
+        {cluster.sections.map((title) => {
+          const section = sectionByTitle.get(title)
+          if (!section) {
+            return null
+          }
+
+          return (
+            <tbody key={title} className="print-market-table__group">
+              <tr className="print-market-table__section-row">
+                <td colSpan={4}>{section.title}</td>
+              </tr>
+              {section.items.map((item) => {
+                const positive = item.changePct >= 0
+                return (
+                  <tr key={item.id}>
+                    <td>{item.name}</td>
+                    <td>{item.symbol ? formatDisplaySymbol(item.symbol) : '—'}</td>
+                    <td>{formatValue(item.value, item.unit)}</td>
+                    <td className={positive ? 'print-market-table__up' : 'print-market-table__down'}>
+                      {formatCompactChange(item.changePct, item.changeValue, item.unit)}
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {items.map((item) => {
-                    const positive = item.changePct >= 0
-                    return (
-                      <tr key={item.id}>
-                        <td>{item.name}</td>
-                        <td>{item.symbol ?? '—'}</td>
-                        <td>{formatValue(item.value, item.unit)}</td>
-                        <td className={positive ? 'trend-up-text' : 'trend-down-text'}>
-                          {formatPercentWithAmount(item.changePct, item.changeValue, item.unit)}
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ))}
-        </>
-      }
-    />
+                )
+              })}
+            </tbody>
+          )
+        })}
+      </table>
+    </section>
   )
 }
 
-function PrintReportBlock({
-  className,
-  head,
-  body,
-}: {
-  className?: string
-  head: ReactNode
-  body: ReactNode
-}) {
+function PrintYieldCurve({ points, domain }: { points: CurvePoint[]; domain: { min: number; max: number } }) {
+  const width = 900
+  const height = 150
+  const paddingLeft = 48
+  const paddingRight = 20
+  const paddingTop = 22
+  const paddingBottom = 36
+  const plotWidth = width - paddingLeft - paddingRight
+  const plotHeight = height - paddingTop - paddingBottom
+
+  const xStep = plotWidth / Math.max(points.length - 1, 1)
+  const xAt = (index: number) => paddingLeft + index * xStep
+  const yAt = (value: number) =>
+    paddingTop + ((domain.max - value) / (domain.max - domain.min || 1)) * plotHeight
+
+  const buildPath = (selector: keyof CurvePoint) =>
+    points
+      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${xAt(index).toFixed(2)} ${yAt(point[selector] as number).toFixed(2)}`)
+      .join(' ')
+
+  const buildArea = (selector: keyof CurvePoint) => {
+    const line = points
+      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${xAt(index).toFixed(2)} ${yAt(point[selector] as number).toFixed(2)}`)
+      .join(' ')
+    const lastX = xAt(points.length - 1)
+    const firstX = xAt(0)
+    const baseY = paddingTop + plotHeight
+    return `${line} L ${lastX.toFixed(2)} ${baseY} L ${firstX.toFixed(2)} ${baseY} Z`
+  }
+
   return (
-    <section className={className ? `print-report__block ${className}` : 'print-report__block'}>
-      <div className="print-report__block-inner">
-        <div className="print-report__block-head">{head}</div>
-        <div className="print-report__block-body">{body}</div>
-      </div>
-    </section>
+    <svg className="print-curve-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Treasury yield curve">
+      <defs>
+        <linearGradient id="printCurveBg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#e0f2fe" />
+          <stop offset="100%" stopColor="#f8fafc" />
+        </linearGradient>
+        <linearGradient id="printCurveFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#8b5cf6" stopOpacity="0.28" />
+          <stop offset="100%" stopColor="#8b5cf6" stopOpacity="0.02" />
+        </linearGradient>
+      </defs>
+
+      <rect x="0" y="0" width={width} height={height} rx="14" fill="url(#printCurveBg)" />
+
+      {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
+        const y = paddingTop + tick * plotHeight
+        const value = domain.max - tick * (domain.max - domain.min)
+        return (
+          <g key={tick}>
+            <line x1={paddingLeft} x2={width - paddingRight} y1={y} y2={y} className="print-curve-grid" />
+            <text x={paddingLeft - 8} y={y + 3} textAnchor="end" className="print-curve-axis">
+              {value.toFixed(1)}%
+            </text>
+          </g>
+        )
+      })}
+
+      <path d={buildArea('current')} fill="url(#printCurveFill)" />
+      <path d={buildPath('oneYearAgo')} className="print-curve-line print-curve-line--year" />
+      <path d={buildPath('oneMonthAgo')} className="print-curve-line print-curve-line--month" />
+      <path d={buildPath('current')} className="print-curve-line print-curve-line--current" />
+
+      {points.map((point, index) => (
+        <g key={point.tenor}>
+          <circle cx={xAt(index)} cy={yAt(point.current)} r="4.5" className="print-curve-dot print-curve-dot--current" />
+          <text x={xAt(index)} y={height - 12} textAnchor="middle" className="print-curve-tenor">
+            {point.tenor}
+          </text>
+          <text x={xAt(index)} y={yAt(point.current) - 10} textAnchor="middle" className="print-curve-label">
+            {point.current.toFixed(2)}%
+          </text>
+        </g>
+      ))}
+    </svg>
   )
 }
 
@@ -776,22 +971,147 @@ function StatTicker({ stats }: { stats: StatItem[] }) {
       <span className="ticker__tag ticker__tag--accent">Overview</span>
       <div className="ticker__viewport">
         <div className="ticker__track" style={{ animationDuration: `${duration}s` } as CSSProperties}>
-          {loop.map((stat, index) => (
-            <span className="ticker__item ticker__stat" key={`${stat.label}-${index}`}>
-              <b>{stat.label}</b>
-              <span>{stat.value}</span>
-              {stat.delta ? (
-                <span className={`stat-chip__delta--${stat.tone}`}>{stat.delta}</span>
-              ) : null}
-            </span>
-          ))}
+          {loop.map((stat, index) => {
+            const content = (
+              <>
+                <b>{stat.label}</b>
+                <span>{stat.value}</span>
+                {stat.delta ? (
+                  <span className={`stat-chip__delta--${stat.tone}`}>{stat.delta}</span>
+                ) : null}
+              </>
+            )
+
+            if (stat.symbol) {
+              return (
+                <a
+                  className="ticker__item ticker__stat ticker__stat--link"
+                  href={yahooQuoteUrl(stat.symbol)}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={`Open ${stat.label} on ${stat.symbol.startsWith('fred:') ? 'FRED' : 'Yahoo Finance'}`}
+                  key={`${stat.label}-${index}`}
+                >
+                  {content}
+                </a>
+              )
+            }
+
+            return (
+              <span className="ticker__item ticker__stat" key={`${stat.label}-${index}`}>
+                {content}
+              </span>
+            )
+          })}
         </div>
       </div>
     </div>
   )
 }
 
-function CollapsibleSection({ section }: { section: ResolvedSection }) {
+function TreasuryCurveBlock({
+  treasuryCurve,
+  curveDomain,
+  compact = false,
+  emptyMessage = 'Loading live treasury curve data…',
+}: {
+  treasuryCurve: CurvePoint[]
+  curveDomain: { min: number; max: number }
+  compact?: boolean
+  emptyMessage?: string
+}) {
+  return (
+    <div className={`curve-wrap ${compact ? 'curve-wrap--compact' : ''}`}>
+      <div className="curve-legend">
+        <LegendItem label="Snapshot" tone="current" />
+        <LegendItem label="1 month prior" tone="month" />
+        <LegendItem label="1 year prior" tone="year" />
+      </div>
+      {treasuryCurve.length > 0 ? (
+        <CurveChart points={treasuryCurve} domain={curveDomain} />
+      ) : (
+        <p className="curve-footnote">{emptyMessage}</p>
+      )}
+    </div>
+  )
+}
+
+function MarketsExplorer({
+  sections,
+  activeSection,
+  activeGroup,
+  onSectionChange,
+  onGroupChange,
+  treasuryCurve,
+  curveDomain,
+}: {
+  sections: ResolvedSection[]
+  activeSection: ResolvedSection
+  activeGroup: string | null
+  onSectionChange: (title: string) => void
+  onGroupChange: (group: string) => void
+  treasuryCurve: CurvePoint[]
+  curveDomain: { min: number; max: number }
+}) {
+  const sectionLookup = useMemo(() => new Map(sections.map((section) => [section.title, section])), [sections])
+
+  return (
+    <section className="markets-hub" aria-label="Market instruments">
+      <nav className="markets-hub__nav" aria-label="Market sections">
+        {MARKET_NAV_CLUSTERS.map((cluster) => (
+          <div className="markets-nav-cluster" key={cluster.id}>
+            <p className="markets-nav-cluster__label">{cluster.label}</p>
+            <div className="markets-nav-cluster__items">
+              {cluster.sections.map((title) => {
+                const section = sectionLookup.get(title)
+                if (!section) {
+                  return null
+                }
+
+                return (
+                  <button
+                    key={title}
+                    type="button"
+                    className={`markets-nav-item ${activeSection.title === title ? 'is-active' : ''}`}
+                    onClick={() => onSectionChange(title)}
+                    aria-current={activeSection.title === title ? 'page' : undefined}
+                  >
+                    <span className="markets-nav-item__label">{SECTION_SHORT_LABELS[title] ?? title}</span>
+                    <span className="markets-nav-item__count">{section.items.length}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        ))}
+      </nav>
+
+      <div className="markets-hub__main">
+        <MarketSectionView
+          section={activeSection}
+          activeGroup={activeGroup}
+          onGroupChange={onGroupChange}
+          treasuryCurve={treasuryCurve}
+          curveDomain={curveDomain}
+        />
+      </div>
+    </section>
+  )
+}
+
+function MarketSectionView({
+  section,
+  activeGroup,
+  onGroupChange,
+  treasuryCurve,
+  curveDomain,
+}: {
+  section: ResolvedSection
+  activeGroup: string | null
+  onGroupChange: (group: string) => void
+  treasuryCurve: CurvePoint[]
+  curveDomain: { min: number; max: number }
+}) {
   const groupedItems: Array<{ group: string; items: InstrumentSnapshot[] }> = section.groups
     ? section.groups.map((group) => ({
         group,
@@ -799,70 +1119,111 @@ function CollapsibleSection({ section }: { section: ResolvedSection }) {
       }))
     : [{ group: section.title, items: section.items }]
 
+  const visibleItems = section.groups
+    ? groupedItems.find(({ group }) => group === activeGroup)?.items ?? groupedItems[0]?.items ?? []
+    : section.items
+
+  const showCurve = section.title === CURVE_AFTER_SECTION
+
   return (
-    <CollapsiblePanel
-      title={section.title}
-      subtitle={section.subtitle}
-      defaultOpen={section.defaultOpen ?? false}
-      badge={`${section.items.length} instruments`}
-    >
+    <div className="market-section">
+      <header className="market-section__header">
+        <h2>{section.title}</h2>
+        <p>{section.subtitle}</p>
+      </header>
+
       {section.groups ? (
-        <div className="group-stack">
+        <div className="group-pills" role="tablist" aria-label={`${section.title} groups`}>
           {groupedItems.map(({ group, items }) => (
-            <details className="group-dropdown" key={group} open={group === section.groups?.[0]}>
-              <summary>
-                <span>{group}</span>
-                <span className="group-dropdown__count">{items.length} items</span>
-              </summary>
-              <div className="asset-grid">
-                {items.map((item) => (
-                  <AssetCard key={item.id} item={item} />
-                ))}
-              </div>
-            </details>
+            <button
+              key={group}
+              type="button"
+              role="tab"
+              aria-selected={activeGroup === group}
+              className={`group-pills__button ${activeGroup === group ? 'is-active' : ''}`}
+              onClick={() => onGroupChange(group)}
+            >
+              {group}
+              <span className="group-pills__count">{items.length}</span>
+            </button>
           ))}
         </div>
-      ) : (
-        <div className="asset-grid">
-          {section.items.map((item) => (
-            <AssetCard key={item.id} item={item} />
-          ))}
+      ) : null}
+
+      <InstrumentTable items={visibleItems} showGroup={!section.groups} />
+
+      {showCurve ? (
+        <div className="market-section__curve">
+          <h3>U.S. Treasury yield curve</h3>
+          <p className="market-section__curve-note">
+            Yields across maturities — snapshot versus one month and one year prior
+          </p>
+          <TreasuryCurveBlock treasuryCurve={treasuryCurve} curveDomain={curveDomain} compact />
         </div>
-      )}
-    </CollapsiblePanel>
+      ) : null}
+    </div>
   )
 }
 
-function CollapsiblePanel({
-  title,
-  subtitle,
-  children,
-  defaultOpen = false,
-  eyebrow,
-  badge,
-  action,
-}: {
-  title: string
-  subtitle: string
-  children: ReactNode
-  defaultOpen?: boolean
-  eyebrow?: string
-  badge?: string
-  action?: ReactNode
-}) {
+function InstrumentTable({ items, showGroup }: { items: InstrumentSnapshot[]; showGroup: boolean }) {
+  if (items.length === 0) {
+    return <p className="instrument-table__empty">No instruments in this view.</p>
+  }
+
   return (
-    <details className="collapsible-panel" open={defaultOpen}>
-      <summary className="collapsible-panel__summary">
-        <div className="collapsible-panel__heading">
-          {eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}
-          <h2>{title}</h2>
-          <p>{subtitle}</p>
-        </div>
-        {action ? <div className="collapsible-panel__action">{action}</div> : null}
-        {badge ? <span className="collapsible-panel__badge">{badge}</span> : null}
-      </summary>
-      <div className="collapsible-panel__body">{children}</div>
-    </details>
+    <div className="instrument-table">
+      <div className="instrument-table__head" aria-hidden="true">
+        <span>Instrument</span>
+        <span>Trend</span>
+        <span>Price</span>
+        <span>Change</span>
+        <span>Symbol</span>
+      </div>
+      {items.map((item) => (
+        <InstrumentRow key={item.id} item={item} showGroup={showGroup} />
+      ))}
+    </div>
+  )
+}
+
+function InstrumentRow({ item, showGroup }: { item: InstrumentSnapshot; showGroup: boolean }) {
+  const positive = item.changePct >= 0
+  const href = item.symbol ? yahooQuoteUrl(item.symbol) : undefined
+
+  const content = (
+    <>
+      <div className="instrument-row__name">
+        {showGroup ? <span className="instrument-row__group">{item.group}</span> : null}
+        <strong>{item.name}</strong>
+      </div>
+      <div className="instrument-row__spark">
+        <Sparkline series={item.series ?? []} positive={positive} />
+      </div>
+      <div className="instrument-row__value">{formatValue(item.value, item.unit)}</div>
+      <span className={`instrument-row__delta ${positive ? 'trend-up' : 'trend-down'}`}>
+        {formatCompactChange(item.changePct, item.changeValue, item.unit)}
+      </span>
+      <span className="instrument-row__symbol" title={item.symbol ?? undefined}>
+        {item.symbol ? formatDisplaySymbol(item.symbol) : '—'}
+        {item.isLive ? <i className="live-dot" aria-label="live data" /> : null}
+      </span>
+    </>
+  )
+
+  if (!href) {
+    return <div className="instrument-row">{content}</div>
+  }
+
+  return (
+    <a
+      className="instrument-row instrument-row--link"
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title={item.symbol?.startsWith('fred:') ? 'Open on FRED' : 'Open on Yahoo Finance'}
+    >
+      {content}
+    </a>
   )
 }
 
@@ -901,49 +1262,6 @@ function Sparkline({ series, positive }: { series: number[]; positive: boolean }
         r="2.4"
       />
     </svg>
-  )
-}
-
-function AssetCard({ item }: { item: InstrumentSnapshot }) {
-  const positive = item.changePct >= 0
-  const href = item.symbol ? yahooQuoteUrl(item.symbol) : undefined
-
-  const content = (
-    <>
-      <div className="asset-card__top">
-        <div className="asset-card__id">
-          <p className="asset-card__group">{item.group}</p>
-          <h3>{item.name}</h3>
-        </div>
-        <div className="asset-card__quote">
-          <div className="asset-card__value">{formatValue(item.value, item.unit)}</div>
-          <span className={`trend-badge ${positive ? 'trend-up' : 'trend-down'}`}>
-            {formatPercentWithAmount(item.changePct, item.changeValue, item.unit)}
-          </span>
-        </div>
-      </div>
-      <div className="asset-card__chart">
-        <span className="asset-card__change-label">Change {formatSignedAmount(item.changeValue, item.unit)}</span>
-        <Sparkline series={item.series ?? []} positive={positive} />
-      </div>
-      <div className="asset-card__meta">
-        <span className="asset-card__symbol">
-          {item.symbol ?? '—'}
-          {item.isLive ? <i className="live-dot" aria-label="live data" /> : null}
-        </span>
-        <span>{item.isLive ? 'Live · click for Yahoo Finance' : 'Snapshot model'}</span>
-      </div>
-    </>
-  )
-
-  if (!href) {
-    return <article className="asset-card">{content}</article>
-  }
-
-  return (
-    <a className="asset-card asset-card--link" href={href} target="_blank" rel="noreferrer">
-      {content}
-    </a>
   )
 }
 
@@ -1069,6 +1387,7 @@ function applyMarketData(
     (item.symbol ? marketLookup.get(slugify(item.symbol)) : undefined)
 
   if (liveQuote) {
+    const liveNote = item.symbol?.startsWith('fred:') ? 'Live FRED series' : 'Live quote'
     return {
       ...snapshot,
       value: liveQuote.value,
@@ -1076,7 +1395,7 @@ function applyMarketData(
       changeValue: liveQuote.changeValue,
       series: liveQuote.series,
       isLive: true,
-      note: 'Live quote',
+      note: liveNote,
     }
   }
 
@@ -1295,27 +1614,30 @@ function changeLabel(changePct?: number) {
   return `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%`
 }
 
-function indexStat(label: string, quote?: ComputedQuote): StatItem {
+function indexStat(label: string, symbol: string, quote?: ComputedQuote): StatItem {
   return {
     label,
+    symbol,
     value: quote ? formatValue(quote.value, 'index') : '—',
     delta: changeLabel(quote?.changePct),
     tone: statTone(quote?.changePct),
   }
 }
 
-function priceStat(label: string, quote?: ComputedQuote): StatItem {
+function priceStat(label: string, symbol: string, quote?: ComputedQuote): StatItem {
   return {
     label,
+    symbol,
     value: quote ? formatValue(quote.value, 'price') : '—',
     delta: changeLabel(quote?.changePct),
     tone: statTone(quote?.changePct),
   }
 }
 
-function yieldStat(label: string, quote?: ComputedQuote): StatItem {
+function yieldStat(label: string, symbol: string, quote?: ComputedQuote): StatItem {
   return {
     label,
+    symbol,
     value: quote ? formatValue(quote.value, 'yield') : '—',
     delta:
       quote == null

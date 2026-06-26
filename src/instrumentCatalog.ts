@@ -1,3 +1,5 @@
+import { collectCountryIndexSymbols } from './barometer/countryIndexCatalog'
+
 export type TimeFrame = '1D' | '1W' | '1M' | '3M' | '1Y'
 export type Unit = 'index' | 'price' | 'yield' | 'fx' | 'rate'
 
@@ -80,6 +82,71 @@ export const summarySymbols = {
   twoYear: '2YY=F',
   dollar: 'DX-Y.NYB',
   crude: 'CL=F',
+}
+
+export type StyleBoxCell = {
+  cap: 'Large' | 'Mid' | 'Small'
+  style: 'Value' | 'Blend' | 'Growth'
+  label: string
+  symbol: string
+  name: string
+}
+
+export const usStyleBarometerCells: StyleBoxCell[] = [
+  { cap: 'Large', style: 'Value', label: 'Large value', symbol: 'SPYV', name: 'S&P 500 Value ETF (SPYV)' },
+  { cap: 'Large', style: 'Blend', label: 'Large core', symbol: 'SPY', name: 'S&P 500 ETF (SPY)' },
+  { cap: 'Large', style: 'Growth', label: 'Large growth', symbol: 'SPYG', name: 'S&P 500 Growth ETF (SPYG)' },
+  { cap: 'Mid', style: 'Value', label: 'Mid value', symbol: 'IJJ', name: 'S&P MidCap 400 Value ETF (IJJ)' },
+  { cap: 'Mid', style: 'Blend', label: 'Mid core', symbol: 'MDY', name: 'S&P MidCap 400 ETF (MDY)' },
+  { cap: 'Mid', style: 'Growth', label: 'Mid growth', symbol: 'IJK', name: 'S&P MidCap 400 Growth ETF (IJK)' },
+  { cap: 'Small', style: 'Value', label: 'Small value', symbol: 'IWN', name: 'Russell 2000 Value ETF (IWN)' },
+  { cap: 'Small', style: 'Blend', label: 'Small core', symbol: 'IWM', name: 'Russell 2000 ETF (IWM)' },
+  { cap: 'Small', style: 'Growth', label: 'Small growth', symbol: 'IWO', name: 'Russell 2000 Growth ETF (IWO)' },
+]
+
+export function collectBarometerSymbols() {
+  return [
+    ...new Set([
+      ...usStyleBarometerCells.map((cell) => cell.symbol),
+      ...collectCountryIndexSymbols(),
+    ]),
+  ]
+}
+
+const FIXED_INCOME_SECTIONS = new Set([
+  'Rates and Treasury yields',
+  'Central bank policy rates',
+  'Global 10-year sovereign yields',
+  'Bonds and credit',
+  'Global bond ETFs',
+])
+
+export function collectFredSymbols() {
+  return [
+    ...new Set(
+      collectSymbols(
+        sectionDefinitions
+          .filter((section) => section.title === 'Central bank policy rates' || section.title === 'Global 10-year sovereign yields')
+          .flatMap((section) => section.items),
+      ).filter((symbol) => symbol.startsWith('fred:')),
+    ),
+  ]
+}
+
+export function collectBondSymbols() {
+  return [
+    ...new Set(
+      collectSymbols(
+        sectionDefinitions
+          .filter((section) => FIXED_INCOME_SECTIONS.has(section.title))
+          .flatMap((section) => section.items),
+      ).filter((symbol) => !symbol.startsWith('fred:')),
+    ),
+  ]
+}
+
+export function collectFixedIncomeSymbols() {
+  return [...new Set([...collectFredSymbols(), ...collectBondSymbols()])]
 }
 
 export const sectionDefinitions: SectionDefinition[] = [
@@ -199,15 +266,14 @@ export const sectionDefinitions: SectionDefinition[] = [
   },
   {
     title: 'Central bank policy rates',
-    subtitle:
-      'Key policy benchmarks for major economies. U.S. and euro-area series update daily; other markets via FRED/OECD and may refresh monthly.',
+    subtitle: 'Key policy benchmarks for major economies, sourced live from FRED.',
     defaultOpen: false,
     items: buildGroup('Policy rates', 'yield', [
-      ['United States (Fed funds target)', 'fred:DFEDTARU', 4.5, 0, 0.05],
-      ['Euro area (ECB deposit facility)', 'fred:ECBDFR', 2.25, 0, 0.05],
+      ['US Fed funds', 'fred:DFEDTARU', 4.5, 0, 0.05],
+      ['Euro area ECB', 'fred:ECBDFR', 2.25, 0, 0.05],
       ['United Kingdom', 'fred:IRSTCI01GBM156N', 3.75, 0, 0.05],
       ['Japan', 'fred:IRSTCI01JPM156N', 0.5, 0, 0.02],
-      ['China (1-year loan rate)', 'fred:INTDSRCNM193N', 3.0, 0, 0.05],
+      ['China loan rate', 'fred:INTDSRCNM193N', 3.0, 0, 0.05],
       ['Australia', 'fred:IRSTCI01AUM156N', 4.1, 0, 0.05],
       ['Canada', 'fred:IRSTCI01CAM156N', 2.25, 0, 0.05],
       ['India', 'fred:IRSTCI01INM156N', 5.5, 0, 0.05],
@@ -216,8 +282,7 @@ export const sectionDefinitions: SectionDefinition[] = [
   },
   {
     title: 'Global 10-year sovereign yields',
-    subtitle:
-      'Benchmark 10-year government yields across major markets. U.S. data is live daily; international series are sourced from FRED/OECD and typically update monthly.',
+    subtitle: 'Benchmark 10-year government yields across major markets, sourced live from FRED and Yahoo.',
     defaultOpen: false,
     items: buildGroup('10-year yields', 'yield', [
       ['United States', '^TNX', 4.36, -0.03, 0.14],
@@ -237,7 +302,7 @@ export const sectionDefinitions: SectionDefinition[] = [
   {
     title: 'Bonds and credit',
     subtitle:
-      'Core fixed-income proxies, municipals, convertibles, REITs, and rate-sensitive credit sleeves.',
+      'Core fixed-income proxies, municipals, convertibles, REITs, and rate-sensitive credit sleeves — live ETF quotes.',
     defaultOpen: false,
     items: buildGroup('Bonds', 'price', [
       ['US Agg Bond (AGG)', 'AGG', 98, 0.12, 0.7],

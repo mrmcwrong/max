@@ -10,6 +10,17 @@ const NEWS_TOPICS = [
   '(stock market OR S&P 500 OR Wall Street OR Nasdaq OR bank stocks)',
 ]
 
+const BREAKING_NEWS_TOPICS = [
+  'breaking (Federal Reserve OR Fed OR FOMC OR interest rates OR Powell OR inflation OR CPI)',
+  'breaking (earnings OR profit warning OR revenue miss OR guidance cut OR bank failure)',
+  'breaking (oil OR OPEC OR war OR geopolitical OR sanctions OR missile OR attack)',
+  'breaking (stock market crash OR selloff OR rally OR S&P 500 OR Wall Street OR Nasdaq)',
+  'breaking (tariffs OR trade war OR Trump OR executive order OR emergency)',
+]
+
+const BREAKING_NEWS_HOURS = 8
+const NEWS_FEED_LIMIT = 36
+
 function toYmd(date: Date) {
   return date.toISOString().slice(0, 10)
 }
@@ -223,7 +234,10 @@ export async function handleNewsFeed(req: IncomingMessage, res: ServerResponse) 
   const params = readQuery(req)
   const date = params.get('date')
   const time = params.get('time')
-  const cacheKey = `news:${date ?? 'now'}:${time ?? '16:00'}`
+  const isBreaking = params.get('mode') === 'breaking'
+  const cacheKey = isBreaking
+    ? `news:breaking:${Math.floor(Date.now() / (5 * 60 * 1000))}`
+    : `news:${date ?? 'now'}:${time ?? '16:00'}`
   const cachedNews = readNewsCache(cacheKey)
   if (cachedNews) {
     res.statusCode = 200
@@ -233,16 +247,19 @@ export async function handleNewsFeed(req: IncomingMessage, res: ServerResponse) 
     return
   }
 
-  const snapshotMs =
-    date && /^\d{4}-\d{2}-\d{2}$/.test(date)
+  const snapshotMs = isBreaking
+    ? Date.now()
+    : date && /^\d{4}-\d{2}-\d{2}$/.test(date)
       ? estDateTimeToMs(date, time && /^\d{2}:\d{2}$/.test(time) ? time : '16:00')
       : Date.now()
 
-  const afterYmd = toYmd(new Date(snapshotMs - 36 * 60 * 60 * 1000))
+  const lookbackHours = isBreaking ? BREAKING_NEWS_HOURS : 36
+  const afterYmd = toYmd(new Date(snapshotMs - lookbackHours * 60 * 60 * 1000))
   const beforeYmd = toYmd(new Date(snapshotMs + 24 * 60 * 60 * 1000))
+  const topics = isBreaking ? BREAKING_NEWS_TOPICS : NEWS_TOPICS
 
   const feedResults = await Promise.allSettled(
-    NEWS_TOPICS.map((topic) =>
+    topics.map((topic) =>
       fetch(buildTopicNewsUrl(topic, afterYmd, beforeYmd), {
         headers: {
           Accept: 'application/rss+xml, application/xml, text/xml, */*',
@@ -267,18 +284,41 @@ export async function handleNewsFeed(req: IncomingMessage, res: ServerResponse) 
       }
       seen.add(key)
 
-      const score = scoreNewsItem(item, snapshotMs)
+      const score = isBreaking ? scoreBreakingNewsItem(item, snapshotMs) : scoreNewsItem(item, snapshotMs)
       if (score > 0) {
         ranked.push({ ...item, score })
       }
     }
   }
 
+  if (ranked.length < NEWS_FEED_LIMIT) {
+    for (const result of feedResults) {
+      if (result.status !== 'fulfilled') {
+        continue
+      }
+
+      for (const item of parseGoogleNewsRss(result.value)) {
+        const key = normalizeHeadlineKey(item.title)
+        if (seen.has(key)) {
+          continue
+        }
+        seen.add(key)
+
+        const score = isBreaking
+          ? scoreBreakingNewsFallback(item, snapshotMs)
+          : scoreNewsFallback(item, snapshotMs)
+        if (score > 0) {
+          ranked.push({ ...item, score })
+        }
+      }
+    }
+  }
+
   ranked.sort((left, right) => right.score - left.score || right.publishedAt - left.publishedAt)
 
-  const headlines = ranked.slice(0, 16).map(({ score: _score, publishedAt, ...item }) => ({
+  const headlines = ranked.slice(0, NEWS_FEED_LIMIT).map(({ score: _score, publishedAt, ...item }) => ({
     ...item,
-    detail: formatNewsDetail(publishedAt),
+    detail: isBreaking ? formatBreakingNewsDetail(publishedAt) : formatNewsDetail(publishedAt),
   }))
 
   writeNewsCache(cacheKey, headlines)
@@ -372,6 +412,68 @@ function scoreNewsItem(item: ParsedNewsItem, snapshotMs: number) {
   return score
 }
 
+function scoreBreakingNewsItem(item: ParsedNewsItem, snapshotMs: number) {
+  if (item.publishedAt > snapshotMs + 10 * 60 * 1000) {
+    return -1
+  }
+
+  const hoursBefore = (snapshotMs - item.publishedAt) / (60 * 60 * 1000)
+  if (hoursBefore < 0 || hoursBefore > BREAKING_NEWS_HOURS) {
+    return -1
+  }
+
+  let score = (BREAKING_NEWS_HOURS - hoursBefore) * 6
+
+  const text = `${item.title} ${item.category}`.toLowerCase()
+  const keywordGroups = [
+    ['breaking', 'urgent', 'just in', 'developing', 'live updates'],
+    ['fed', 'fomc', 'interest rate', 'powell', 'rate cut', 'rate hike', 'inflation', 'cpi', 'jobs report'],
+    ['earnings', 'profit warning', 'guidance', 'revenue miss', 'bank failure', 'downgrade'],
+    ['war', 'attack', 'missile', 'sanctions', 'geopolit', 'conflict', 'iran', 'ukraine', 'israel'],
+    ['oil', 'crude', 'opec', 'tariff', 'trade war', 'emergency', 'executive order'],
+    ['crash', 'selloff', 'plunge', 'surge', 'rally', 'record high', 'record low'],
+    ['s&p', 'nasdaq', 'dow', 'wall street', 'stock market'],
+  ]
+
+  for (const group of keywordGroups) {
+    if (group.some((keyword) => text.includes(keyword))) {
+      score += 4
+    }
+  }
+
+  if (/reuters|bloomberg|wall street journal|financial times|cnbc|associated press|ap news|barron/i.test(item.category)) {
+    score += 3
+  }
+
+  return score >= 6 ? score : -1
+}
+
+function scoreBreakingNewsFallback(item: ParsedNewsItem, snapshotMs: number) {
+  if (item.publishedAt > snapshotMs + 10 * 60 * 1000) {
+    return -1
+  }
+
+  const hoursBefore = (snapshotMs - item.publishedAt) / (60 * 60 * 1000)
+  if (hoursBefore < 0 || hoursBefore > BREAKING_NEWS_HOURS) {
+    return -1
+  }
+
+  return (BREAKING_NEWS_HOURS - hoursBefore) * 3
+}
+
+function scoreNewsFallback(item: ParsedNewsItem, snapshotMs: number) {
+  if (item.publishedAt > snapshotMs + 20 * 60 * 1000) {
+    return -1
+  }
+
+  const hoursBefore = (snapshotMs - item.publishedAt) / (60 * 60 * 1000)
+  if (hoursBefore < 0 || hoursBefore > 72) {
+    return -1
+  }
+
+  return 72 - hoursBefore
+}
+
 function parseGoogleNewsRss(xml: string): ParsedNewsItem[] {
   const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)]
 
@@ -413,6 +515,27 @@ function formatNewsDetail(publishedAt: number) {
     minute: '2-digit',
     timeZoneName: 'short',
   })
+}
+
+function formatBreakingNewsDetail(publishedAt: number) {
+  const hoursAgo = (Date.now() - publishedAt) / (60 * 60 * 1000)
+  const timestamp = new Date(publishedAt).toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  })
+
+  if (hoursAgo < 1) {
+    const minutesAgo = Math.max(1, Math.round(hoursAgo * 60))
+    return `${minutesAgo} min ago · ${timestamp}`
+  }
+
+  if (hoursAgo < BREAKING_NEWS_HOURS) {
+    return `${Math.round(hoursAgo)}h ago · ${timestamp}`
+  }
+
+  return timestamp
 }
 
 function stripTags(value: string) {

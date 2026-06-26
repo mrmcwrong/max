@@ -25,9 +25,17 @@ type CacheEntry = {
 
 const cache = new Map<string, CacheEntry>()
 
+type YahooChartMeta = {
+  regularMarketPrice?: number
+  chartPreviousClose?: number
+  previousClose?: number
+  regularMarketTime?: number
+}
+
 type YahooChartResponse = {
   chart?: {
     result?: Array<{
+      meta?: YahooChartMeta
       timestamp?: number[]
       indicators?: {
         quote?: Array<{
@@ -68,6 +76,29 @@ function writeCache(key: string, value: SymbolHistory, ttlMs: number) {
   cache.set(key, { value, expires: Date.now() + ttlMs })
 }
 
+function historyFromMeta(meta: YahooChartMeta | undefined, symbol: string): SymbolHistory | null {
+  const value = meta?.regularMarketPrice
+  const previous = meta?.chartPreviousClose ?? meta?.previousClose
+
+  if (value == null || previous == null || !Number.isFinite(value) || !Number.isFinite(previous)) {
+    return null
+  }
+
+  if (value <= 0 || previous <= 0) {
+    return null
+  }
+
+  const now = meta?.regularMarketTime ?? Math.floor(Date.now() / 1000)
+  const prior = now - 24 * 60 * 60
+
+  return {
+    symbol,
+    timestamps: [prior, now],
+    open: [previous, value],
+    close: [previous, value],
+  }
+}
+
 function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolHistory | null {
   const result = payload.chart?.result?.[0]
   const timestamps = result?.timestamp ?? []
@@ -75,8 +106,9 @@ function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolH
   const open = quote?.open ?? []
   const close = quote?.close ?? []
 
-  if (timestamps.length === 0 || close.length === 0) {
-    return null
+  const hasSeries = timestamps.length > 0 && close.some((value) => value != null)
+  if (!hasSeries) {
+    return historyFromMeta(result?.meta, symbol)
   }
 
   const history: SymbolHistory = {
@@ -97,7 +129,7 @@ function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolH
     history.open.push(open[index] ?? closeValue)
   }
 
-  return history.close.length > 0 ? history : null
+  return history.close.length > 0 ? history : historyFromMeta(result?.meta, symbol)
 }
 
 async function fetchYahooChart(url: string): Promise<SymbolHistory | null> {

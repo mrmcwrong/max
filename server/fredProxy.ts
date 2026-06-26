@@ -41,60 +41,62 @@ function readQuery(req: IncomingMessage) {
 }
 
 export async function fetchFredHistory(seriesId: string): Promise<FredHistory | null> {
-  const response = await fetch(
-    `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`,
-    {
-      headers: {
-        Accept: 'text/csv,text/plain,*/*',
-        'User-Agent': USER_AGENT,
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetch(
+      `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`,
+      {
+        headers: {
+          Accept: 'text/csv,text/plain,*/*',
+          'User-Agent': USER_AGENT,
+        },
       },
-    },
-  )
+    )
 
-  if (!response.ok) {
-    return null
-  }
-
-  const text = await response.text()
-  if (text.startsWith('<!')) {
-    return null
-  }
-
-  const timestamps: number[] = []
-  const open: number[] = []
-  const close: number[] = []
-
-  for (const line of text.trim().split(/\r?\n/).slice(1)) {
-    const [datePart, valuePart] = line.split(',')
-    if (!datePart || !valuePart || valuePart === '.') {
+    if (!response.ok) {
       continue
     }
 
-    const value = Number.parseFloat(valuePart)
-    if (Number.isNaN(value)) {
+    const text = await response.text()
+    if (text.startsWith('<!')) {
       continue
     }
 
-    const parsed = new Date(`${datePart}T12:00:00Z`)
-    if (Number.isNaN(parsed.getTime())) {
-      continue
+    const timestamps: number[] = []
+    const open: number[] = []
+    const close: number[] = []
+
+    for (const line of text.trim().split(/\r?\n/).slice(1)) {
+      const [datePart, valuePart] = line.split(',')
+      if (!datePart || !valuePart || valuePart === '.') {
+        continue
+      }
+
+      const value = Number.parseFloat(valuePart)
+      if (Number.isNaN(value)) {
+        continue
+      }
+
+      const parsed = new Date(`${datePart}T12:00:00Z`)
+      if (Number.isNaN(parsed.getTime())) {
+        continue
+      }
+
+      timestamps.push(Math.floor(parsed.getTime() / 1000))
+      open.push(value)
+      close.push(value)
     }
 
-    timestamps.push(Math.floor(parsed.getTime() / 1000))
-    open.push(value)
-    close.push(value)
+    if (close.length > 0) {
+      return {
+        symbol: `fred:${seriesId}`,
+        timestamps,
+        open,
+        close,
+      }
+    }
   }
 
-  if (close.length === 0) {
-    return null
-  }
-
-  return {
-    symbol: `fred:${seriesId}`,
-    timestamps,
-    open,
-    close,
-  }
+  return null
 }
 
 export async function handleFredHistory(req: IncomingMessage, res: ServerResponse) {

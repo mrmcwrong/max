@@ -84,7 +84,7 @@ function writeClientCache(key: string, data: MarketBundleCache) {
 }
 
 function dailyCacheKey(symbols: string[]) {
-  return `max:daily:${[...symbols].sort().join('|')}`
+  return `max:daily:v6:${[...symbols].sort().join('|')}`
 }
 
 function intradayCacheKey(date: string, symbols: string[]) {
@@ -199,16 +199,21 @@ export async function fetchMarketBundle(request: MarketBundleRequest, onProgress
 
   await Promise.all(
     chunks.map(async (symbols) => {
-      try {
-        const payload = await postMarketBundle({ symbols, skipDaily: false })
-        Object.assign(mergedHistories, payload.histories)
-        completedChunks += 1
-        onProgress?.({
-          histories: new Map(Object.entries(mergedHistories)),
-          intraday: new Map(Object.entries(mergedIntraday)),
-        })
-      } catch {
-        // Keep partial results from successful chunks.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const payload = await postMarketBundle({ symbols, skipDaily: false })
+          Object.assign(mergedHistories, payload.histories)
+          completedChunks += 1
+          onProgress?.({
+            histories: new Map(Object.entries(mergedHistories)),
+            intraday: new Map(Object.entries(mergedIntraday)),
+          })
+          return
+        } catch {
+          if (attempt === 1) {
+            // Keep partial results from successful chunks.
+          }
+        }
       }
     }),
   )
@@ -400,6 +405,21 @@ export async function fetchLiveHeadlines(date?: string, time?: string) {
   }>
 }
 
+export async function fetchBreakingHeadlines() {
+  const response = await fetch('/api/news?mode=breaking', { cache: 'no-store' })
+
+  if (!response.ok) {
+    throw new Error('Breaking news request failed')
+  }
+
+  return (await response.json()) as Array<{
+    category: string
+    title: string
+    detail: string
+    url?: string
+  }>
+}
+
 export type MarketMover = {
   symbol: string
   name: string
@@ -435,6 +455,54 @@ export function yahooQuoteUrl(symbol: string) {
   }
 
   return `https://finance.yahoo.com/quote/${encodeURIComponent(symbol)}`
+}
+
+const FRED_DISPLAY_SYMBOLS: Record<string, string> = {
+  'fred:DFEDTARU': 'Fed',
+  'fred:ECBDFR': 'ECB',
+  'fred:IRSTCI01GBM156N': 'UK',
+  'fred:IRSTCI01JPM156N': 'JP',
+  'fred:INTDSRCNM193N': 'CN',
+  'fred:IRSTCI01AUM156N': 'AU',
+  'fred:IRSTCI01CAM156N': 'CA',
+  'fred:IRSTCI01INM156N': 'IN',
+  'fred:IRSTCI01KRM156N': 'KR',
+  'fred:IRLTLT01GBM156N': 'UK 10Y',
+  'fred:IRLTLT01DEM156N': 'DE 10Y',
+  'fred:IRLTLT01FRM156N': 'FR 10Y',
+  'fred:IRLTLT01ITM156N': 'IT 10Y',
+  'fred:IRLTLT01ESM156N': 'ES 10Y',
+  'fred:IRLTLT01JPM156N': 'JP 10Y',
+  'fred:IRLTLT01AUM156N': 'AU 10Y',
+  'fred:IRLTLT01CAM156N': 'CA 10Y',
+  'fred:IRLTLT01CHM156N': 'CN 10Y',
+  'fred:IRLTLT01KRM156N': 'KR 10Y',
+  'fred:IRLTLT01MXM156N': 'MX 10Y',
+}
+
+export function formatDisplaySymbol(symbol: string) {
+  const mapped = FRED_DISPLAY_SYMBOLS[symbol]
+  if (mapped) {
+    return mapped
+  }
+
+  if (symbol.startsWith('fred:')) {
+    const seriesId = symbol.slice(5)
+    return seriesId.length <= 10 ? seriesId : `${seriesId.slice(0, 8)}…`
+  }
+
+  return symbol
+}
+
+export function formatCompactChange(changePct: number, changeValue: number, unit: Unit) {
+  const sign = changePct >= 0 ? '+' : ''
+  const percent = `${sign}${changePct.toFixed(2)}%`
+
+  if (unit === 'yield' || unit === 'rate') {
+    return percent
+  }
+
+  return formatPercentWithAmount(changePct, changeValue, unit)
 }
 
 export function formatPercentWithAmount(changePct: number, changeValue: number, unit: Unit) {
