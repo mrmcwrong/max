@@ -37,6 +37,7 @@ import {
   type DeviceSettings,
   type PinnedTicker,
 } from './deviceSettings'
+import { exportSnapshot, type SnapshotExportInput, type SnapshotOverviewRow } from './exportSnapshot'
 import {
   computeCurvePoint,
   computeIntradayQuote,
@@ -177,6 +178,7 @@ function MarketBarometer() {
     market: 'loading',
     news: 'loading',
   })
+  const [exportBusy, setExportBusy] = useState(false)
 
   const pinnedSymbolList = useMemo(
     () => deviceSettings.pinnedTickers.map((ticker) => ticker.symbol),
@@ -571,11 +573,53 @@ function MarketBarometer() {
     setDeviceSettings({ ...defaultDeviceSettings, pinnedTickers: [] })
   }, [])
 
-  const handlePrint = useCallback(() => {
+  const handleExportPdf = useCallback(() => {
     void ensureWorldAtlasReady().then(() => {
       setTimeout(() => window.print(), 120)
     })
   }, [])
+
+  const snapshotExportInput = useMemo<SnapshotExportInput>(
+    () => ({
+      snapshotDate,
+      snapshotTimeLabel,
+      timeFrame,
+      timeFrameLabel: frameLabels[timeFrame],
+      liveView,
+      newsMode: breakingNews && breakingHeadlines.length > 0 ? 'breaking' : 'snapshot',
+      sections: orderedSections,
+      overviewRows: buildOverviewExportRows(liveQuotes),
+      treasuryCurve,
+      headlines: activeHeadlines,
+      pinnedTickers: deviceSettings.pinnedTickers,
+      liveQuotes,
+    }),
+    [
+      snapshotDate,
+      snapshotTimeLabel,
+      timeFrame,
+      liveView,
+      breakingNews,
+      breakingHeadlines.length,
+      orderedSections,
+      liveQuotes,
+      treasuryCurve,
+      activeHeadlines,
+      deviceSettings.pinnedTickers,
+    ],
+  )
+
+  const handleExport = useCallback(
+    async (format: 'csv' | 'xlsx') => {
+      setExportBusy(true)
+      try {
+        await exportSnapshot(snapshotExportInput, format)
+      } finally {
+        setExportBusy(false)
+      }
+    },
+    [snapshotExportInput],
+  )
 
   if (view === 'settings') {
     return (
@@ -680,9 +724,6 @@ function MarketBarometer() {
           ) : null}
 
           <div className="toolbar__actions">
-            <button type="button" className="toolbar__settings" onClick={() => setView('settings')}>
-              Settings
-            </button>
             <button
               type="button"
               className={`toolbar__live ${liveView ? 'is-active' : ''}`}
@@ -692,9 +733,44 @@ function MarketBarometer() {
             >
               {isLoading ? '…' : 'Live'}
             </button>
-            <button type="button" onClick={handlePrint}>
-              Print
+            <button type="button" className="toolbar__settings" onClick={() => setView('settings')}>
+              Settings
             </button>
+            <details className="toolbar__export">
+              <summary>Export</summary>
+              <div className="toolbar__export-menu">
+                <button
+                  type="button"
+                  disabled={exportBusy}
+                  onClick={(event) => {
+                    handleExportPdf()
+                    event.currentTarget.closest('details')?.removeAttribute('open')
+                  }}
+                >
+                  PDF report
+                </button>
+                <button
+                  type="button"
+                  disabled={exportBusy}
+                  onClick={(event) => {
+                    void handleExport('csv')
+                    event.currentTarget.closest('details')?.removeAttribute('open')
+                  }}
+                >
+                  {exportBusy ? 'Exporting…' : 'CSV file'}
+                </button>
+                <button
+                  type="button"
+                  disabled={exportBusy}
+                  onClick={(event) => {
+                    void handleExport('xlsx')
+                    event.currentTarget.closest('details')?.removeAttribute('open')
+                  }}
+                >
+                  {exportBusy ? 'Exporting…' : 'Excel workbook'}
+                </button>
+              </div>
+            </details>
           </div>
         </div>
       </header>
@@ -1767,6 +1843,36 @@ function yieldStat(label: string, symbol: string, quote?: ComputedQuote): StatIt
         ? undefined
         : `${quote.changeValue >= 0 ? '+' : ''}${Math.round(quote.changeValue * 100)} bps`,
     tone: statTone(quote?.changeValue),
+  }
+}
+
+function buildOverviewExportRows(liveQuotes: Map<string, ComputedQuote>): SnapshotOverviewRow[] {
+  return [
+    overviewExportRow('S&P 500', summarySymbols.sp500, 'index', liveQuotes.get(summarySymbols.sp500)),
+    overviewExportRow('Russell 2000', summarySymbols.russell2000, 'index', liveQuotes.get(summarySymbols.russell2000)),
+    overviewExportRow('Nasdaq', summarySymbols.nasdaq, 'index', liveQuotes.get(summarySymbols.nasdaq)),
+    overviewExportRow('Dow Jones', summarySymbols.dow, 'index', liveQuotes.get(summarySymbols.dow)),
+    overviewExportRow('VIX', summarySymbols.vix, 'index', liveQuotes.get(summarySymbols.vix)),
+    overviewExportRow('10Y Treasury', summarySymbols.tenYear, 'yield', liveQuotes.get(summarySymbols.tenYear)),
+    overviewExportRow('2Y Treasury', summarySymbols.twoYear, 'yield', liveQuotes.get(summarySymbols.twoYear)),
+    overviewExportRow('DXY', summarySymbols.dollar, 'index', liveQuotes.get(summarySymbols.dollar)),
+    overviewExportRow('Crude Oil', summarySymbols.crude, 'price', liveQuotes.get(summarySymbols.crude)),
+  ]
+}
+
+function overviewExportRow(
+  label: string,
+  symbol: string,
+  unit: Unit,
+  quote?: ComputedQuote,
+): SnapshotOverviewRow {
+  return {
+    label,
+    symbol,
+    unit,
+    value: quote?.value ?? null,
+    changePct: quote?.changePct ?? null,
+    changeValue: quote?.changeValue ?? null,
   }
 }
 
