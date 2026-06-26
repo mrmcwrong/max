@@ -927,7 +927,12 @@ function MarketBarometer() {
 
       <section className="overview-hub">
         <section className="glance">
-          <PinnedTickerStrip tickers={deviceSettings.pinnedTickers} liveQuotes={liveQuotes} />
+          <PinnedTickerStrip
+            tickers={deviceSettings.pinnedTickers}
+            liveQuotes={liveQuotes}
+            onAddPinnedTicker={addPinnedTicker}
+            onRemovePinnedTicker={removePinnedTicker}
+          />
           <StatTicker stats={stats} />
         </section>
 
@@ -1262,43 +1267,158 @@ function PrintYieldCurve({ points, domain }: { points: CurvePoint[]; domain: { m
 function PinnedTickerStrip({
   tickers,
   liveQuotes,
+  onAddPinnedTicker,
+  onRemovePinnedTicker,
 }: {
   tickers: PinnedTicker[]
   liveQuotes: Map<string, ComputedQuote>
+  onAddPinnedTicker: (symbol: string, label: string) => void
+  onRemovePinnedTicker: (id: string) => void
 }) {
-  if (tickers.length === 0) {
-    return null
+  const [addOpen, setAddOpen] = useState(false)
+  const [symbolDraft, setSymbolDraft] = useState('')
+  const [pinError, setPinError] = useState('')
+  const addPanelRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!addOpen) {
+      return
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!addPanelRef.current?.contains(event.target as Node)) {
+        setAddOpen(false)
+        setPinError('')
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    return () => document.removeEventListener('mousedown', handlePointerDown)
+  }, [addOpen])
+
+  const submitPin = () => {
+    const symbol = normalizeTickerSymbol(symbolDraft)
+    if (!symbol) {
+      setPinError('Enter a symbol.')
+      return
+    }
+
+    if (tickers.some((ticker) => ticker.symbol === symbol)) {
+      setPinError('Already pinned.')
+      return
+    }
+
+    onAddPinnedTicker(symbol, symbol)
+    setSymbolDraft('')
+    setPinError('')
+    setAddOpen(false)
   }
+
+  const addButton = (
+    <button
+      type="button"
+      className={`pinned-ticker__add${addOpen ? ' is-open' : ''}`}
+      aria-label="Add pinned ticker"
+      aria-expanded={addOpen}
+      title="Add pinned ticker"
+      onClick={() => {
+        setAddOpen((open) => !open)
+        setPinError('')
+      }}
+    >
+      +
+    </button>
+  )
 
   return (
     <div className="ticker ticker--pinned">
       <span className="ticker__tag">Pinned</span>
-      <div className="pinned-ticker__list">
-        {tickers.map((ticker) => {
-          const quote = liveQuotes.get(ticker.symbol)
-          const stat = pinnedTickerStat(ticker, quote)
-          const content = (
-            <>
-              <b>{stat.label}</b>
-              <span className="pinned-ticker__symbol">{formatDisplaySymbol(ticker.symbol)}</span>
-              <span>{stat.value}</span>
-              {stat.delta ? <span className={`stat-chip__delta--${stat.tone}`}>{stat.delta}</span> : null}
-            </>
-          )
+      <div className={`pinned-ticker__body${addOpen ? ' is-form-open' : ''}`} ref={addPanelRef}>
+        {tickers.length === 0 ? (
+          <>
+            <div className="pinned-ticker__adder">{addButton}</div>
+            <p className="pinned-ticker__empty">Pin tickers to track them here.</p>
+          </>
+        ) : (
+          <>
+            <div className="pinned-ticker__scroll">
+              <div className="pinned-ticker__list">
+                {tickers.map((ticker) => {
+                  const quote = liveQuotes.get(ticker.symbol)
+                  const stat = pinnedTickerStat(ticker, quote)
+                  const content = (
+                    <>
+                      <b className="pinned-ticker__symbol">{formatDisplaySymbol(ticker.symbol)}</b>
+                      <span>{stat.value}</span>
+                      {stat.delta ? <span className={`stat-chip__delta--${stat.tone}`}>{stat.delta}</span> : null}
+                    </>
+                  )
 
-          return (
-            <a
-              key={ticker.id}
-              className="pinned-ticker__item"
-              href={yahooQuoteUrl(ticker.symbol)}
-              target="_blank"
-              rel="noreferrer"
-              title={`Open ${ticker.label} on Yahoo Finance`}
-            >
-              {content}
-            </a>
-          )
-        })}
+                  return (
+                    <div key={ticker.id} className="pinned-ticker__item-wrap">
+                      <a
+                        className="pinned-ticker__item"
+                        href={yahooQuoteUrl(ticker.symbol)}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={`Open ${formatDisplaySymbol(ticker.symbol)} on Yahoo Finance`}
+                      >
+                        {content}
+                      </a>
+                      <button
+                        type="button"
+                        className="pinned-ticker__remove"
+                        aria-label={`Remove ${formatDisplaySymbol(ticker.symbol)}`}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          onRemovePinnedTicker(ticker.id)
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            <div className="pinned-ticker__adder">{addButton}</div>
+          </>
+        )}
+        {addOpen ? (
+          <div className="pinned-ticker__form" role="dialog" aria-label="Add pinned ticker">
+            <label className="pinned-ticker__field" htmlFor="pinnedSymbolQuick">
+              <span>Symbol</span>
+              <input
+                id="pinnedSymbolQuick"
+                type="text"
+                value={symbolDraft}
+                placeholder="e.g. NVDA"
+                spellCheck={false}
+                autoCapitalize="characters"
+                autoFocus
+                onChange={(event) => {
+                  setSymbolDraft(event.target.value)
+                  setPinError('')
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    submitPin()
+                  }
+                  if (event.key === 'Escape') {
+                    setAddOpen(false)
+                    setPinError('')
+                  }
+                }}
+              />
+            </label>
+            {pinError ? <p className="pinned-ticker__error">{pinError}</p> : null}
+            <button type="button" className="pinned-ticker__submit" onClick={submitPin}>
+              Pin
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   )
