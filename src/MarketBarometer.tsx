@@ -316,8 +316,10 @@ function MarketBarometer() {
         })
       }
 
+      // FRED first — one function invocation for all policy rates and global 10Y yields.
+      await fetchFredBundle(onHistoryProgress, { force: options?.force })
+
       const usEquityPromise = fetchUsEquityBundle(onHistoryProgress, { force: options?.force })
-      const fredPromise = fetchFredBundle(onHistoryProgress, { force: options?.force })
       const fixedIncomePromise = fetchFixedIncomeBundle(onHistoryProgress, { force: options?.force })
       const internationalPromise = fetchInternationalPriorityBundle(onHistoryProgress, { force: options?.force })
       const pinnedPromise =
@@ -329,7 +331,6 @@ function MarketBarometer() {
       const priorityResults = await Promise.allSettled([
         customMarketPromise,
         usEquityPromise,
-        fredPromise,
         fixedIncomePromise,
         internationalPromise,
         pinnedPromise,

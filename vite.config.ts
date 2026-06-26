@@ -1,6 +1,7 @@
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { handleFredHistory } from './server/fredProxy.js'
+import { handleFredBundle } from './server/fredBundle.js'
 import { handleMarketBundle } from './server/marketBundle.js'
 import { handleMovers, handleNewsFeed, handleYahooChart } from './server/yahooProxy.js'
 
@@ -51,6 +52,18 @@ function marketApiPlugin(): Plugin {
       void handleFredHistory(req, res).catch(() => {
         res.statusCode = 502
         res.end(JSON.stringify({ error: 'FRED history proxy failed' }))
+      })
+    })
+
+    server.middlewares.use('/api/fred/bundle', (req: any, res: any, next: () => void) => {
+      if (req.method !== 'POST') {
+        next()
+        return
+      }
+
+      void handleFredBundle(req, res).catch(() => {
+        res.statusCode = 502
+        res.end(JSON.stringify({ error: 'FRED bundle failed' }))
       })
     })
 

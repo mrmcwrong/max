@@ -680,45 +680,22 @@ export function hydrateFredCache(): MarketBundleResult | null {
   return { histories, intraday: new Map() }
 }
 
-async function fetchFredSeries(seriesId: string): Promise<SymbolHistory | null> {
-  const symbol = `fred:${seriesId}`
+async function postFredBundle(seriesIds: string[]): Promise<Record<string, SymbolHistory>> {
+  const response = await fetch('/api/fred/bundle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ series: seriesIds }),
+  })
 
-  try {
-    const response = await fetch(`/api/fred/history?series=${encodeURIComponent(seriesId)}`, {
-      cache: 'no-store',
-    })
-    if (response.ok) {
-      const history = (await response.json()) as SymbolHistory
-      if (isUsableDailyHistory(history, symbol)) {
-        return history
-      }
-    }
-  } catch {
-    // Fall through to market-bundle fallback.
+  if (!response.ok) {
+    throw new Error(`FRED bundle request failed (${response.status})`)
   }
 
-  try {
-    const payload = await withBundleSlot(() => postMarketBundle({ symbols: [symbol], skipDaily: false }))
-    const history = payload.histories[symbol]
-    if (isUsableDailyHistory(history, symbol)) {
-      return history
-    }
-  } catch {
-    // Both paths failed for this series.
-  }
-
-  return null
+  const payload = (await response.json()) as { histories?: Record<string, SymbolHistory> }
+  return payload.histories ?? {}
 }
 
-async function fetchFredBatch(seriesIds: string[]) {
-  const results = await Promise.all(seriesIds.map((seriesId) => fetchFredSeries(seriesId)))
-  return seriesIds.map((seriesId, index) => ({
-    symbol: `fred:${seriesId}`,
-    history: results[index],
-  }))
-}
-
-/** FRED policy rates and sovereign yields — one lightweight request per series. */
+/** FRED policy rates and sovereign yields — single server-side bundle fetch. */
 export async function fetchFredBundle(
   onProgress?: MarketBundleProgress,
   options?: { force?: boolean; symbols?: string[] },
@@ -732,16 +709,22 @@ export async function fetchFredBundle(
   const toFetch = symbolsNeedingFetch(symbols, options?.force)
   const merged = new Map(cached)
 
-  for (let index = 0; index < toFetch.length; index += 3) {
-    const batch = toFetch.slice(index, index + 3)
-    const results = await fetchFredBatch(batch.map((symbol) => symbol.slice(5)))
-    for (const { symbol, history } of results) {
-      if (!history) {
-        continue
+  if (toFetch.length > 0) {
+    const seriesIds = toFetch.map((symbol) => symbol.slice(5))
+
+    try {
+      const histories = await postFredBundle(seriesIds)
+      writeSymbolHistories(histories)
+
+      for (const [symbol, history] of Object.entries(histories)) {
+        if (isUsableDailyHistory(history, symbol)) {
+          merged.set(symbol, history)
+        }
       }
-      writeSymbolHistory(history)
-      merged.set(symbol, history)
+    } catch {
+      // Reconciliation loop retries missing FRED symbols later.
     }
+
     if (merged.size > 0) {
       onProgress?.({ histories: new Map(merged), intraday: new Map() })
     }

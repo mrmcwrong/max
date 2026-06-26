@@ -28,6 +28,10 @@ export const FRED_SERIES_IDS = [
 
 const ALLOWED_SERIES = new Set<string>(FRED_SERIES_IDS)
 
+export function isAllowedFredSeries(seriesId: string) {
+  return ALLOWED_SERIES.has(seriesId)
+}
+
 export type FredHistory = {
   symbol: string
   timestamps: number[]
@@ -40,17 +44,95 @@ function readQuery(req: IncomingMessage) {
   return url.searchParams
 }
 
-export async function fetchFredHistory(seriesId: string): Promise<FredHistory | null> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const response = await fetch(
-      `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`,
-      {
-        headers: {
-          Accept: 'text/csv,text/plain,*/*',
-          'User-Agent': USER_AGENT,
-        },
+type FredObservationsResponse = {
+  observations?: Array<{ date?: string; value?: string }>
+}
+
+function historyFromRows(seriesId: string, rows: Array<{ date: string; value: number }>): FredHistory | null {
+  if (rows.length === 0) {
+    return null
+  }
+
+  const timestamps: number[] = []
+  const open: number[] = []
+  const close: number[] = []
+
+  for (const row of rows) {
+    const parsed = new Date(`${row.date}T12:00:00Z`)
+    if (Number.isNaN(parsed.getTime())) {
+      continue
+    }
+
+    timestamps.push(Math.floor(parsed.getTime() / 1000))
+    open.push(row.value)
+    close.push(row.value)
+  }
+
+  if (close.length === 0) {
+    return null
+  }
+
+  return {
+    symbol: `fred:${seriesId}`,
+    timestamps,
+    open,
+    close,
+  }
+}
+
+async function fetchFredFromApi(seriesId: string): Promise<FredHistory | null> {
+  const apiKey = process.env.FRED_API_KEY
+  if (!apiKey) {
+    return null
+  }
+
+  const url = new URL('https://api.stlouisfed.org/fred/series/observations')
+  url.searchParams.set('series_id', seriesId)
+  url.searchParams.set('api_key', apiKey)
+  url.searchParams.set('file_type', 'json')
+  url.searchParams.set('observation_start', '2018-01-01')
+  url.searchParams.set('sort_order', 'asc')
+
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json' },
+  })
+
+  if (!response.ok) {
+    return null
+  }
+
+  const payload = (await response.json()) as FredObservationsResponse
+  const rows: Array<{ date: string; value: number }> = []
+
+  for (const observation of payload.observations ?? []) {
+    if (!observation.date || observation.value == null || observation.value === '.') {
+      continue
+    }
+
+    const value = Number.parseFloat(observation.value)
+    if (Number.isNaN(value)) {
+      continue
+    }
+
+    rows.push({ date: observation.date, value })
+  }
+
+  return historyFromRows(seriesId, rows)
+}
+
+async function fetchFredCsv(seriesId: string): Promise<FredHistory | null> {
+  const urls = [
+    `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}&cosd=2018-01-01`,
+    `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`,
+  ]
+
+  for (const csvUrl of urls) {
+    const response = await fetch(csvUrl, {
+      headers: {
+        Accept: 'text/csv,text/plain,*/*',
+        'User-Agent': USER_AGENT,
       },
-    )
+    })
 
     if (!response.ok) {
       continue
@@ -61,9 +143,7 @@ export async function fetchFredHistory(seriesId: string): Promise<FredHistory | 
       continue
     }
 
-    const timestamps: number[] = []
-    const open: number[] = []
-    const close: number[] = []
+    const rows: Array<{ date: string; value: number }> = []
 
     for (const line of text.trim().split(/\r?\n/).slice(1)) {
       const [datePart, valuePart] = line.split(',')
@@ -76,23 +156,32 @@ export async function fetchFredHistory(seriesId: string): Promise<FredHistory | 
         continue
       }
 
-      const parsed = new Date(`${datePart}T12:00:00Z`)
-      if (Number.isNaN(parsed.getTime())) {
-        continue
-      }
-
-      timestamps.push(Math.floor(parsed.getTime() / 1000))
-      open.push(value)
-      close.push(value)
+      rows.push({ date: datePart, value })
     }
 
-    if (close.length > 0) {
-      return {
-        symbol: `fred:${seriesId}`,
-        timestamps,
-        open,
-        close,
-      }
+    const history = historyFromRows(seriesId, rows)
+    if (history) {
+      return history
+    }
+  }
+
+  return null
+}
+
+export async function fetchFredHistory(seriesId: string): Promise<FredHistory | null> {
+  if (!isAllowedFredSeries(seriesId)) {
+    return null
+  }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const fromApi = await fetchFredFromApi(seriesId)
+    if (fromApi) {
+      return fromApi
+    }
+
+    const fromCsv = await fetchFredCsv(seriesId)
+    if (fromCsv) {
+      return fromCsv
     }
   }
 
