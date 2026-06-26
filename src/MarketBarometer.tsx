@@ -21,6 +21,7 @@ import {
   frameWeights,
   sectionDefinitions,
   summarySymbols,
+  usStyleBarometerCells,
   timeFrameOptions,
   treasuryCurveSymbols,
   type CurvePoint,
@@ -69,6 +70,8 @@ import {
   formatCompactChange,
   formatDisplaySymbol,
   getNowEst,
+  isUsableDailyHistory,
+  snapshotAnchorMs,
   snapshotTimeForMode,
   yahooQuoteUrl,
   type ComputedQuote,
@@ -243,6 +246,8 @@ function MarketBarometer() {
     () => [
       ...new Set([
         ...Object.values(summarySymbols),
+        ...usStyleBarometerCells.map((cell) => cell.symbol),
+        ...collectInternationalPrioritySymbols(),
         ...treasuryCurveSymbols.map((point) => point.symbol),
       ]),
     ],
@@ -254,7 +259,11 @@ function MarketBarometer() {
       if (bundle.histories.size > 0) {
         setHistories((current) => {
           const next = new Map(current)
-          bundle.histories.forEach((history, symbol) => next.set(symbol, history))
+          bundle.histories.forEach((history, symbol) => {
+            if (isUsableDailyHistory(history, symbol)) {
+              next.set(symbol, history)
+            }
+          })
           return next
         })
         setFeedStatus((current) => ({ ...current, market: 'live' }))
@@ -516,8 +525,11 @@ function MarketBarometer() {
       while (!cancelled) {
         const have = historiesRef.current
         const missing = allSymbols.filter(
-          (symbol) =>
-            !have.has(symbol) && (failureCounts.get(symbol) ?? 0) < MAX_ATTEMPTS_PER_SYMBOL,
+          (symbol) => {
+            const history = have.get(symbol)
+            const needsData = !history || !isUsableDailyHistory(history, symbol)
+            return needsData && (failureCounts.get(symbol) ?? 0) < MAX_ATTEMPTS_PER_SYMBOL
+          },
         )
 
         if (missing.length === 0) {
@@ -553,14 +565,12 @@ function MarketBarometer() {
     }
   }, [allSymbols, mergeMarketBundle])
 
-  const snapshotDateMs = useMemo(() => {
-    const parsed = new Date(`${snapshotDate}T23:59:59`)
-    return Number.isNaN(parsed.getTime()) ? Date.now() : parsed.getTime()
-  }, [snapshotDate])
+  const snapshotDateMs = useMemo(
+    () => snapshotAnchorMs(snapshotDate, timeMode, customTime),
+    [snapshotDate, timeMode, customTime],
+  )
 
-  const customDateTimeMs = useMemo(() => {
-    return estDateTimeToMs(snapshotDate, customTime || '12:00')
-  }, [snapshotDate, customTime])
+  const customDateTimeMs = snapshotDateMs
 
   const liveQuotes = useMemo(() => {
     const map = new Map<string, ComputedQuote>()

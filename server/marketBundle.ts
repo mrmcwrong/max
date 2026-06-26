@@ -12,6 +12,16 @@ const FETCH_CONCURRENCY = 10
 const FUNCTION_BUDGET_MS = 9_000
 
 const LONG_HISTORY_SYMBOLS = new Set(['^IRX', '2YY=F', '^FVX', '^TNX', '^TYX'])
+const MIN_YAHOO_DAILY_POINTS = 10
+
+function isUsableYahooHistory(history: SymbolHistory | null): history is SymbolHistory {
+  if (!history?.close?.length) {
+    return false
+  }
+
+  const validCloses = history.close.filter((value) => value != null && Number.isFinite(value))
+  return validCloses.length >= MIN_YAHOO_DAILY_POINTS
+}
 
 export type SymbolHistory = {
   symbol: string
@@ -78,29 +88,6 @@ function writeCache(key: string, value: SymbolHistory, ttlMs: number) {
   cache.set(key, { value, expires: Date.now() + ttlMs })
 }
 
-function historyFromMeta(meta: YahooChartMeta | undefined, symbol: string): SymbolHistory | null {
-  const value = meta?.regularMarketPrice
-  const previous = meta?.chartPreviousClose ?? meta?.previousClose
-
-  if (value == null || previous == null || !Number.isFinite(value) || !Number.isFinite(previous)) {
-    return null
-  }
-
-  if (value <= 0 || previous <= 0) {
-    return null
-  }
-
-  const now = meta?.regularMarketTime ?? Math.floor(Date.now() / 1000)
-  const prior = now - 24 * 60 * 60
-
-  return {
-    symbol,
-    timestamps: [prior, now],
-    open: [previous, value],
-    close: [previous, value],
-  }
-}
-
 function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolHistory | null {
   const result = payload.chart?.result?.[0]
   const timestamps = result?.timestamp ?? []
@@ -110,7 +97,7 @@ function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolH
 
   const hasSeries = timestamps.length > 0 && close.some((value) => value != null)
   if (!hasSeries) {
-    return historyFromMeta(result?.meta, symbol)
+    return null
   }
 
   const history: SymbolHistory = {
@@ -131,7 +118,7 @@ function parseChartPayload(payload: YahooChartResponse, symbol: string): SymbolH
     history.open.push(open[index] ?? closeValue)
   }
 
-  return history.close.length > 0 ? history : historyFromMeta(result?.meta, symbol)
+  return isUsableYahooHistory(history) ? history : null
 }
 
 async function fetchYahooChart(url: string): Promise<SymbolHistory | null> {

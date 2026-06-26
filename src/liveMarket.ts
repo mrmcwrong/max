@@ -132,6 +132,32 @@ function writeLocalCache(key: string, data: MarketBundleCache) {
   }
 }
 
+const MIN_YAHOO_DAILY_POINTS = 10
+const MIN_FRED_DAILY_POINTS = 2
+
+export function isUsableDailyHistory(
+  history: SymbolHistory | null | undefined,
+  symbol?: string,
+): history is SymbolHistory {
+  if (!history?.timestamps?.length || !history.close?.length) {
+    return false
+  }
+
+  const validCloses = history.close.filter((value) => value != null && Number.isFinite(value))
+  const minimum = symbol?.startsWith('fred:') ? MIN_FRED_DAILY_POINTS : MIN_YAHOO_DAILY_POINTS
+  return validCloses.length >= minimum
+}
+
+export function snapshotAnchorMs(date: string, timeMode: TimeMode, customTime: string) {
+  if (timeMode === 'custom') {
+    return estDateTimeToMs(date, customTime || '12:00')
+  }
+  if (timeMode === 'open') {
+    return estDateTimeToMs(date, '09:30')
+  }
+  return estDateTimeToMs(date, '16:00')
+}
+
 function readSymbolHistory(symbol: string): SymbolHistory | null {
   try {
     const raw = localStorage.getItem(`${SYMBOL_CACHE_PREFIX}${symbol}`)
@@ -144,6 +170,10 @@ function readSymbolHistory(symbol: string): SymbolHistory | null {
       return null
     }
 
+    if (!isUsableDailyHistory(parsed.history, symbol)) {
+      return null
+    }
+
     return parsed.history
   } catch {
     return null
@@ -151,6 +181,10 @@ function readSymbolHistory(symbol: string): SymbolHistory | null {
 }
 
 function writeSymbolHistory(history: SymbolHistory) {
+  if (!isUsableDailyHistory(history, history.symbol)) {
+    return
+  }
+
   try {
     localStorage.setItem(
       `${SYMBOL_CACHE_PREFIX}${history.symbol}`,
@@ -174,7 +208,7 @@ function readSymbolHistories(symbols: string[]) {
 
 function writeSymbolHistories(histories: Record<string, SymbolHistory>) {
   for (const history of Object.values(histories)) {
-    if (history?.symbol) {
+    if (history?.symbol && isUsableDailyHistory(history, history.symbol)) {
       writeSymbolHistory(history)
     }
   }
@@ -235,7 +269,7 @@ export function hydrateMarketCache(symbols: string[]): MarketBundleResult | null
 
   if (cached) {
     for (const [symbol, history] of Object.entries(cached.data.histories)) {
-      if (!histories.has(symbol)) {
+      if (!histories.has(symbol) && isUsableDailyHistory(history, symbol)) {
         histories.set(symbol, history)
       }
     }
@@ -647,14 +681,41 @@ export function hydrateFredCache(): MarketBundleResult | null {
 }
 
 async function fetchFredSeries(seriesId: string): Promise<SymbolHistory | null> {
-  return withBundleSlot(async () => {
-    const response = await fetch(`/api/fred/history?series=${encodeURIComponent(seriesId)}`)
-    if (!response.ok) {
-      return null
-    }
+  const symbol = `fred:${seriesId}`
 
-    return (await response.json()) as SymbolHistory
-  })
+  try {
+    const response = await fetch(`/api/fred/history?series=${encodeURIComponent(seriesId)}`, {
+      cache: 'no-store',
+    })
+    if (response.ok) {
+      const history = (await response.json()) as SymbolHistory
+      if (isUsableDailyHistory(history, symbol)) {
+        return history
+      }
+    }
+  } catch {
+    // Fall through to market-bundle fallback.
+  }
+
+  try {
+    const payload = await withBundleSlot(() => postMarketBundle({ symbols: [symbol], skipDaily: false }))
+    const history = payload.histories[symbol]
+    if (isUsableDailyHistory(history, symbol)) {
+      return history
+    }
+  } catch {
+    // Both paths failed for this series.
+  }
+
+  return null
+}
+
+async function fetchFredBatch(seriesIds: string[]) {
+  const results = await Promise.all(seriesIds.map((seriesId) => fetchFredSeries(seriesId)))
+  return seriesIds.map((seriesId, index) => ({
+    symbol: `fred:${seriesId}`,
+    history: results[index],
+  }))
 }
 
 /** FRED policy rates and sovereign yields — one lightweight request per series. */
@@ -671,11 +732,17 @@ export async function fetchFredBundle(
   const toFetch = symbolsNeedingFetch(symbols, options?.force)
   const merged = new Map(cached)
 
-  for (const symbol of toFetch) {
-    const history = await fetchFredSeries(symbol.slice(5))
-    if (history) {
+  for (let index = 0; index < toFetch.length; index += 3) {
+    const batch = toFetch.slice(index, index + 3)
+    const results = await fetchFredBatch(batch.map((symbol) => symbol.slice(5)))
+    for (const { symbol, history } of results) {
+      if (!history) {
+        continue
+      }
       writeSymbolHistory(history)
       merged.set(symbol, history)
+    }
+    if (merged.size > 0) {
       onProgress?.({ histories: new Map(merged), intraday: new Map() })
     }
   }
