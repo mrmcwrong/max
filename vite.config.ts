@@ -1,4 +1,4 @@
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { handleFredHistory } from './server/fredProxy.js'
 import { handleFredBundle } from './server/fredBundle.js'
@@ -88,6 +88,13 @@ function marketApiPlugin(): Plugin {
 }
 
 // https://vite.dev/config/
-export default defineConfig({
-  plugins: [react(), marketApiPlugin()],
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  if (env.FRED_API_KEY) {
+    process.env.FRED_API_KEY = env.FRED_API_KEY
+  }
+
+  return {
+    plugins: [react(), marketApiPlugin()],
+  }
 })
