@@ -176,67 +176,6 @@ function useWorldAtlasFeatures(): MapFeature[] {
   return features
 }
 
-export function filterHeadlinesByCategory(headlines: Headline[], selectedCategories: string[]) {
-  if (selectedCategories.length === 0) {
-    return headlines
-  }
-
-  const allowed = new Set(selectedCategories)
-  return headlines.filter((headline) => allowed.has(headline.category))
-}
-
-export function NewsCategoryFilter({
-  categories,
-  selectedCategories,
-  onSelectedCategoriesChange,
-}: {
-  categories: string[]
-  selectedCategories: string[]
-  onSelectedCategoriesChange: (categories: string[]) => void
-}) {
-  const allSelected = selectedCategories.length === 0
-  const summary = allSelected
-    ? 'All categories'
-    : selectedCategories.length === 1
-      ? selectedCategories[0]
-      : `${selectedCategories.length} categories`
-
-  const toggleCategory = (category: string) => {
-    if (selectedCategories.includes(category)) {
-      onSelectedCategoriesChange(selectedCategories.filter((entry) => entry !== category))
-      return
-    }
-
-    onSelectedCategoriesChange([...selectedCategories, category])
-  }
-
-  return (
-    <details className="news-category-filter">
-      <summary aria-label="Filter headlines by category">{summary}</summary>
-      <div className="news-category-filter__menu" role="group" aria-label="News categories">
-        <label className="news-category-filter__option">
-          <input
-            type="checkbox"
-            checked={allSelected}
-            onChange={() => onSelectedCategoriesChange([])}
-          />
-          <span>All categories</span>
-        </label>
-        {categories.map((category) => (
-          <label key={category} className="news-category-filter__option">
-            <input
-              type="checkbox"
-              checked={!allSelected && selectedCategories.includes(category)}
-              onChange={() => toggleCategory(category)}
-            />
-            <span>{category}</span>
-          </label>
-        ))}
-      </div>
-    </details>
-  )
-}
-
 export function NewsModeToggle({
   breakingNews,
   breakingAvailable,
@@ -273,9 +212,6 @@ type OverviewBoardProps = BarometerProps & {
   breakingNews: boolean
   breakingAvailable: boolean
   onBreakingNewsChange: (enabled: boolean) => void
-  newsCategories: string[]
-  selectedNewsCategories: string[]
-  onSelectedNewsCategoriesChange: (categories: string[]) => void
   onMoreHeadlines: () => void
   renderHeadline: (headline: Headline) => ReactNode
 }
@@ -287,9 +223,6 @@ export function OverviewBoard({
   breakingNews,
   breakingAvailable,
   onBreakingNewsChange,
-  newsCategories,
-  selectedNewsCategories,
-  onSelectedNewsCategoriesChange,
   onMoreHeadlines,
   renderHeadline,
 }: OverviewBoardProps) {
@@ -306,11 +239,6 @@ export function OverviewBoard({
               breakingNews={breakingNews}
               breakingAvailable={breakingAvailable}
               onBreakingNewsChange={onBreakingNewsChange}
-            />
-            <NewsCategoryFilter
-              categories={newsCategories}
-              selectedCategories={selectedNewsCategories}
-              onSelectedCategoriesChange={onSelectedNewsCategoriesChange}
             />
             <button type="button" className="panel-link" onClick={onMoreHeadlines}>
               More market headlines →

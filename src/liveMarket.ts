@@ -161,8 +161,16 @@ export function hydrateCountryMapCache(): MarketBundleResult | null {
   return mapsFromCache(cached.data)
 }
 
-export function hydrateUsEquityCache(): MarketBundleResult | null {
-  const cached = readCachedDaily(US_EQUITY_BUNDLE_CACHE_KEY)
+function pinnedCacheKey(symbols: string[]) {
+  return `max:pinned:daily:v1:${[...symbols].sort().join('|')}`
+}
+
+export function hydratePinnedCache(symbols: string[]): MarketBundleResult | null {
+  if (symbols.length === 0) {
+    return null
+  }
+
+  const cached = readCachedDaily(pinnedCacheKey(symbols))
   if (!cached) {
     return null
   }
@@ -402,6 +410,29 @@ async function fetchChunkedBundle(
   const result = mapsFromCache(cachePayload)
   onProgress?.(result)
   return result
+}
+
+export function hydrateUsEquityCache(): MarketBundleResult | null {
+  const cached = readCachedDaily(US_EQUITY_BUNDLE_CACHE_KEY)
+  if (!cached) {
+    return null
+  }
+
+  return mapsFromCache(cached.data)
+}
+
+/** User-pinned tickers — fetched early so they are not stuck at the end of the main queue. */
+export async function fetchPinnedBundle(
+  symbols: string[],
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean },
+) {
+  const unique = [...new Set(symbols.filter(Boolean))]
+  if (unique.length === 0) {
+    return { histories: new Map<string, SymbolHistory>(), intraday: new Map<string, SymbolHistory>() }
+  }
+
+  return fetchChunkedBundle(unique, pinnedCacheKey(unique), 0.85, onProgress, options)
 }
 
 /** US summary belt, style box, and treasury — small dedicated fetch that fits Netlify's 10s cap. */
