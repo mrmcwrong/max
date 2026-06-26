@@ -573,18 +573,18 @@ function MarketBarometer() {
   const customDateTimeMs = snapshotDateMs
 
   const liveQuotes = useMemo(() => {
+    const useIntraday = liveView || timeMode === 'custom'
     const map = new Map<string, ComputedQuote>()
     histories.forEach((history, symbol) => {
-      const quote =
-        timeMode === 'custom'
-          ? computeIntradayQuote(history, intraday.get(symbol), snapshotDateMs, customDateTimeMs, timeFrame)
-          : computeQuote(history, snapshotDateMs, timeMode, timeFrame)
+      const quote = useIntraday
+        ? computeIntradayQuote(history, intraday.get(symbol), snapshotDateMs, customDateTimeMs, timeFrame)
+        : computeQuote(history, snapshotDateMs, timeMode, timeFrame)
       if (quote) {
         map.set(symbol, quote)
       }
     })
     return map
-  }, [histories, intraday, snapshotDateMs, customDateTimeMs, timeMode, timeFrame])
+  }, [histories, intraday, snapshotDateMs, customDateTimeMs, timeMode, timeFrame, liveView])
 
   const snapshotSeed = hashString(`${timeFrame}|${snapshotDate}|${timeMode}|${timeMode === 'custom' ? customTime : ''}`)
   const marketLookup = useMemo(() => buildMarketOverrideLookup(customMarketFeed), [customMarketFeed])
@@ -642,19 +642,6 @@ function MarketBarometer() {
 
     setActiveMarketGroup(activeSection.groups?.[0] ?? null)
   }, [activeSection?.title, activeSection?.groups])
-
-  useEffect(() => {
-    if (!activeSection) {
-      return
-    }
-
-    const symbols = collectSymbols(activeSection.items)
-    if (symbols.length === 0) {
-      return
-    }
-
-    void fetchMarketBundle({ symbols }, mergeMarketBundle)
-  }, [activeSection?.title, mergeMarketBundle])
 
   const treasuryCurve = useMemo<CurvePoint[]>(() => {
     return treasuryCurveSymbols
