@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type CSSProperties,
@@ -25,6 +26,17 @@ import {
   type Unit,
 } from './instrumentCatalog'
 import { OverviewBoard, NewsModeToggle, PrintBarometerBlock, ensureWorldAtlasReady } from './MarketBarometers'
+import SettingsPage from './SettingsPage'
+import { applyDeviceTheme } from './applyDeviceTheme'
+import {
+  clearDeviceSettings,
+  defaultDeviceSettings,
+  normalizeTickerSymbol,
+  readDeviceSettings,
+  writeDeviceSettings,
+  type DeviceSettings,
+  type PinnedTicker,
+} from './deviceSettings'
 import {
   computeCurvePoint,
   computeIntradayQuote,
@@ -143,12 +155,13 @@ const SECTION_SHORT_LABELS: Record<string, string> = {
 }
 
 function MarketBarometer() {
+  const [deviceSettings, setDeviceSettings] = useState<DeviceSettings>(() => readDeviceSettings())
   const [timeFrame, setTimeFrame] = useState<TimeFrame>('1W')
   const [snapshotDate, setSnapshotDate] = useState(() => getLastCloseDate())
   const [timeMode, setTimeMode] = useState<TimeMode>('close')
   const [customTime, setCustomTime] = useState('12:00')
   const [liveView, setLiveView] = useState(false)
-  const [view, setView] = useState<'dashboard' | 'headlines'>('dashboard')
+  const [view, setView] = useState<'dashboard' | 'headlines' | 'settings'>('dashboard')
   const [activeMarketSection, setActiveMarketSection] = useState(SECTION_ORDER[0])
   const [activeMarketGroup, setActiveMarketGroup] = useState<string | null>(null)
   const [histories, setHistories] = useState<Map<string, SymbolHistory>>(new Map())
@@ -165,6 +178,11 @@ function MarketBarometer() {
     news: 'loading',
   })
 
+  const pinnedSymbolList = useMemo(
+    () => deviceSettings.pinnedTickers.map((ticker) => ticker.symbol),
+    [deviceSettings.pinnedTickers],
+  )
+
   const allSymbols = useMemo(
     () => [
       ...new Set([
@@ -172,9 +190,10 @@ function MarketBarometer() {
         ...treasuryCurveSymbols.map((point) => point.symbol),
         ...Object.values(summarySymbols),
         ...collectBarometerSymbols(),
+        ...pinnedSymbolList,
       ]),
     ],
-    [],
+    [pinnedSymbolList],
   )
 
   const orderedSymbols = useMemo(() => {
@@ -510,11 +529,66 @@ function MarketBarometer() {
         ? '4 p.m. EST (closing)'
         : `${formatEstTimestamp(snapshotDate, customTime)} (custom)`
 
+  useLayoutEffect(() => {
+    applyDeviceTheme(deviceSettings)
+    writeDeviceSettings(deviceSettings)
+  }, [deviceSettings])
+
+  const patchDeviceSettings = useCallback((patch: Partial<DeviceSettings>) => {
+    setDeviceSettings((current) => ({ ...current, ...patch }))
+  }, [])
+
+  const addPinnedTicker = useCallback((symbol: string, label: string) => {
+    const normalized = normalizeTickerSymbol(symbol)
+    setDeviceSettings((current) => {
+      if (current.pinnedTickers.some((ticker) => ticker.symbol === normalized)) {
+        return current
+      }
+
+      return {
+        ...current,
+        pinnedTickers: [
+          ...current.pinnedTickers,
+          {
+            id: `${normalized}-${Date.now()}`,
+            symbol: normalized,
+            label: label.trim() || normalized,
+          },
+        ],
+      }
+    })
+  }, [])
+
+  const removePinnedTicker = useCallback((id: string) => {
+    setDeviceSettings((current) => ({
+      ...current,
+      pinnedTickers: current.pinnedTickers.filter((ticker) => ticker.id !== id),
+    }))
+  }, [])
+
+  const resetDeviceSettings = useCallback(() => {
+    clearDeviceSettings()
+    setDeviceSettings({ ...defaultDeviceSettings, pinnedTickers: [] })
+  }, [])
+
   const handlePrint = useCallback(() => {
     void ensureWorldAtlasReady().then(() => {
       setTimeout(() => window.print(), 120)
     })
   }, [])
+
+  if (view === 'settings') {
+    return (
+      <SettingsPage
+        settings={deviceSettings}
+        onSettingsChange={patchDeviceSettings}
+        onAddPinnedTicker={addPinnedTicker}
+        onRemovePinnedTicker={removePinnedTicker}
+        onReset={resetDeviceSettings}
+        onBack={() => setView('dashboard')}
+      />
+    )
+  }
 
   if (view === 'headlines') {
     return (
@@ -606,6 +680,9 @@ function MarketBarometer() {
           ) : null}
 
           <div className="toolbar__actions">
+            <button type="button" className="toolbar__settings" onClick={() => setView('settings')}>
+              Settings
+            </button>
             <button
               type="button"
               className={`toolbar__live ${liveView ? 'is-active' : ''}`}
@@ -624,6 +701,7 @@ function MarketBarometer() {
 
       <section className="overview-hub">
         <section className="glance">
+          <PinnedTickerStrip tickers={deviceSettings.pinnedTickers} liveQuotes={liveQuotes} />
           <StatTicker stats={stats} />
         </section>
 
@@ -951,6 +1029,51 @@ function PrintYieldCurve({ points, domain }: { points: CurvePoint[]; domain: { m
         </g>
       ))}
     </svg>
+  )
+}
+
+function PinnedTickerStrip({
+  tickers,
+  liveQuotes,
+}: {
+  tickers: PinnedTicker[]
+  liveQuotes: Map<string, ComputedQuote>
+}) {
+  if (tickers.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="ticker ticker--pinned">
+      <span className="ticker__tag">Pinned</span>
+      <div className="pinned-ticker__list">
+        {tickers.map((ticker) => {
+          const quote = liveQuotes.get(ticker.symbol)
+          const stat = pinnedTickerStat(ticker, quote)
+          const content = (
+            <>
+              <b>{stat.label}</b>
+              <span className="pinned-ticker__symbol">{formatDisplaySymbol(ticker.symbol)}</span>
+              <span>{stat.value}</span>
+              {stat.delta ? <span className={`stat-chip__delta--${stat.tone}`}>{stat.delta}</span> : null}
+            </>
+          )
+
+          return (
+            <a
+              key={ticker.id}
+              className="pinned-ticker__item"
+              href={yahooQuoteUrl(ticker.symbol)}
+              target="_blank"
+              rel="noreferrer"
+              title={`Open ${ticker.label} on Yahoo Finance`}
+            >
+              {content}
+            </a>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 
@@ -1644,6 +1767,32 @@ function yieldStat(label: string, symbol: string, quote?: ComputedQuote): StatIt
         ? undefined
         : `${quote.changeValue >= 0 ? '+' : ''}${Math.round(quote.changeValue * 100)} bps`,
     tone: statTone(quote?.changeValue),
+  }
+}
+
+function pinnedTickerUnit(symbol: string): Unit {
+  if (symbol.startsWith('fred:')) {
+    return 'yield'
+  }
+  if (symbol.startsWith('^')) {
+    return 'index'
+  }
+  return 'price'
+}
+
+function pinnedTickerStat(ticker: PinnedTicker, quote?: ComputedQuote): StatItem {
+  const unit = pinnedTickerUnit(ticker.symbol)
+  return {
+    label: ticker.label,
+    symbol: ticker.symbol,
+    value: quote ? formatValue(quote.value, unit) : '—',
+    delta:
+      unit === 'yield'
+        ? quote == null
+          ? undefined
+          : `${quote.changeValue >= 0 ? '+' : ''}${Math.round(quote.changeValue * 100)} bps`
+        : changeLabel(quote?.changePct),
+    tone: statTone(unit === 'yield' ? quote?.changeValue : quote?.changePct),
   }
 }
 
