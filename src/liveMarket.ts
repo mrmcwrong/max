@@ -1,4 +1,4 @@
-import { collectUsEquityPrioritySymbols, collectFixedIncomeSymbols, type TimeFrame, type Unit } from './instrumentCatalog'
+import { collectUsEquityPrioritySymbols, collectFixedIncomeSymbols, collectFredSymbols, collectBondSymbols, collectInternationalPrioritySymbols, type TimeFrame, type Unit } from './instrumentCatalog'
 import { collectCountryIndexSymbols } from './barometer/countryIndexCatalog'
 
 export type TimeMode = 'open' | 'close' | 'custom'
@@ -42,6 +42,8 @@ const SYMBOL_CACHE_PREFIX = 'max:sym:v1:'
 const MAP_BUNDLE_CACHE_KEY = 'max:map:daily:v1:country-indexes'
 const US_EQUITY_BUNDLE_CACHE_KEY = 'max:us-equity:daily:v1:priority'
 const FIXED_INCOME_BUNDLE_CACHE_KEY = 'max:fixed-income:daily:v1'
+const FRED_BUNDLE_CACHE_KEY = 'max:fred:daily:v1'
+const INTL_PRIORITY_CACHE_KEY = 'max:intl-priority:daily:v1'
 const MIN_BUNDLE_COVERAGE = 0.6
 const MIN_MAP_COVERAGE = 0.85
 const MAX_CONCURRENT_BUNDLE_REQUESTS = 2
@@ -634,13 +636,110 @@ export function hydrateFixedIncomeCache(): MarketBundleResult | null {
   return { histories, intraday: new Map() }
 }
 
-/** Rates, sovereign yields, and bond ETFs — fetched before the long explorer queue. */
+export function hydrateFredCache(): MarketBundleResult | null {
+  const symbols = collectFredSymbols()
+  const histories = readSymbolHistories(symbols)
+  if (histories.size === 0) {
+    return null
+  }
+
+  return { histories, intraday: new Map() }
+}
+
+async function fetchFredSeries(seriesId: string): Promise<SymbolHistory | null> {
+  return withBundleSlot(async () => {
+    const response = await fetch(`/api/fred/history?series=${encodeURIComponent(seriesId)}`)
+    if (!response.ok) {
+      return null
+    }
+
+    return (await response.json()) as SymbolHistory
+  })
+}
+
+/** FRED policy rates and sovereign yields — one lightweight request per series. */
+export async function fetchFredBundle(
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean; symbols?: string[] },
+) {
+  const symbols = [...new Set((options?.symbols ?? collectFredSymbols()).filter(Boolean))]
+  const cached = readSymbolHistories(symbols)
+  if (cached.size > 0) {
+    onProgress?.({ histories: cached, intraday: new Map() })
+  }
+
+  const toFetch = symbolsNeedingFetch(symbols, options?.force)
+  const merged = new Map(cached)
+
+  for (const symbol of toFetch) {
+    const history = await fetchFredSeries(symbol.slice(5))
+    if (history) {
+      writeSymbolHistory(history)
+      merged.set(symbol, history)
+      onProgress?.({ histories: new Map(merged), intraday: new Map() })
+    }
+  }
+
+  if (merged.size > 0) {
+    writeDailyCache(FRED_BUNDLE_CACHE_KEY, {
+      histories: Object.fromEntries(merged),
+      intraday: {},
+    })
+  }
+
+  return { histories: merged, intraday: new Map() }
+}
+
+/** Bond ETFs only — FRED series are fetched separately via fetchFredBundle. */
 export async function fetchFixedIncomeBundle(
   onProgress?: MarketBundleProgress,
   options?: { force?: boolean },
 ) {
-  const symbols = collectFixedIncomeSymbols()
+  const symbols = collectBondSymbols()
   return fetchChunkedBundle(symbols, FIXED_INCOME_BUNDLE_CACHE_KEY, 0.85, onProgress, options)
+}
+
+/** MSCI Japan/UK/Germany — small early fetch so they are not stranded in late chunks. */
+export async function fetchInternationalPriorityBundle(
+  onProgress?: MarketBundleProgress,
+  options?: { force?: boolean },
+) {
+  const symbols = collectInternationalPrioritySymbols()
+  return fetchChunkedBundle(symbols, INTL_PRIORITY_CACHE_KEY, 1, onProgress, options)
+}
+
+/** Retry stubborn missing symbols one at a time (FRED via dedicated proxy). */
+export async function fetchMissingSymbols(
+  symbols: string[],
+  onProgress?: MarketBundleProgress,
+) {
+  const unique = [...new Set(symbols.filter(Boolean))]
+  const merged = new Map<string, SymbolHistory>()
+  const fredSymbols = unique.filter((symbol) => symbol.startsWith('fred:'))
+  const yahooSymbols = unique.filter((symbol) => !symbol.startsWith('fred:'))
+
+  if (fredSymbols.length > 0) {
+    const fredBundle = await fetchFredBundle(onProgress, { symbols: fredSymbols })
+    fredBundle.histories.forEach((history, symbol) => merged.set(symbol, history))
+  }
+
+  for (const symbol of yahooSymbols) {
+    try {
+      const bundle = await fetchMarketBundle({ symbols: [symbol] }, onProgress)
+      const history = bundle.histories.get(symbol)
+      if (history) {
+        merged.set(symbol, history)
+      }
+    } catch {
+      // Try the next symbol.
+    }
+  }
+
+  const result = { histories: merged, intraday: new Map<string, SymbolHistory>() }
+  if (merged.size > 0) {
+    onProgress?.(result)
+  }
+  return result
 }
 
 /** Dedicated fetch for the global equity map — sequential chunks, isolated cache. */

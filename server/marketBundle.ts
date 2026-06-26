@@ -225,7 +225,11 @@ async function mapWithConcurrency<T, R>(
 }
 
 export async function buildMarketBundle(request: BundleRequest): Promise<BundleResponse> {
-  const symbols = [...new Set((request.symbols ?? []).filter(Boolean))]
+  const symbols = [...new Set((request.symbols ?? []).filter(Boolean))].sort((a, b) => {
+    const aFred = a.startsWith('fred:') ? 0 : 1
+    const bFred = b.startsWith('fred:') ? 0 : 1
+    return aFred - bFred
+  })
   const intradaySymbols = [...new Set((request.intradaySymbols ?? []).filter(Boolean))]
   const histories: Record<string, SymbolHistory> = {}
   const intraday: Record<string, SymbolHistory> = {}

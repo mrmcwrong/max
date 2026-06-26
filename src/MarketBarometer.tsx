@@ -11,6 +11,9 @@ import {
   collectBarometerSymbols,
   collectCountryIndexSymbols,
   collectFixedIncomeSymbols,
+  collectFredSymbols,
+  collectBondSymbols,
+  collectInternationalPrioritySymbols,
   collectSymbols,
   collectUsEquityPrioritySymbols,
   fallbackHeadlines,
@@ -52,11 +55,15 @@ import {
   fetchLiveHeadlines,
   fetchCountryMapBundle,
   fetchFixedIncomeBundle,
+  fetchFredBundle,
+  fetchInternationalPriorityBundle,
+  fetchMissingSymbols,
   fetchPinnedBundle,
   fetchUsEquityBundle,
   hydrateMarketCache,
   hydrateCountryMapCache,
   hydrateFixedIncomeCache,
+  hydrateFredCache,
   hydratePinnedCache,
   hydrateUsEquityCache,
   formatCompactChange,
@@ -223,7 +230,9 @@ function MarketBarometer() {
   const remainderSymbols = useMemo(() => {
     const skip = new Set([
       ...collectUsEquityPrioritySymbols(),
-      ...collectFixedIncomeSymbols(),
+      ...collectFredSymbols(),
+      ...collectBondSymbols(),
+      ...collectInternationalPrioritySymbols(),
       ...collectCountryIndexSymbols(),
       ...pinnedSymbolList,
     ])
@@ -299,7 +308,9 @@ function MarketBarometer() {
       }
 
       const usEquityPromise = fetchUsEquityBundle(onHistoryProgress, { force: options?.force })
+      const fredPromise = fetchFredBundle(onHistoryProgress, { force: options?.force })
       const fixedIncomePromise = fetchFixedIncomeBundle(onHistoryProgress, { force: options?.force })
+      const internationalPromise = fetchInternationalPriorityBundle(onHistoryProgress, { force: options?.force })
       const pinnedPromise =
         pinnedSymbolList.length > 0
           ? fetchPinnedBundle(pinnedSymbolList, onHistoryProgress, { force: options?.force })
@@ -309,7 +320,9 @@ function MarketBarometer() {
       const priorityResults = await Promise.allSettled([
         customMarketPromise,
         usEquityPromise,
+        fredPromise,
         fixedIncomePromise,
+        internationalPromise,
         pinnedPromise,
         mapPromise,
         ...(options?.intradayDate ? [historyPromise] : []),
@@ -353,7 +366,7 @@ function MarketBarometer() {
             // Partial explorer data may already be on screen.
           })
       } else {
-        const historyResult = priorityResults[5]
+        const historyResult = priorityResults[7]
         if (historyResult?.status === 'fulfilled' && historyResult.value.intraday.size > 0) {
           setIntradayDate(options.intradayDate)
         }
@@ -436,6 +449,11 @@ function MarketBarometer() {
       mergeMarketBundle(pinnedCached)
     }
 
+    const fredCached = hydrateFredCache()
+    if (fredCached) {
+      mergeMarketBundle(fredCached)
+    }
+
     const fixedIncomeCached = hydrateFixedIncomeCache()
     if (fixedIncomeCached) {
       mergeMarketBundle(fixedIncomeCached)
@@ -492,7 +510,7 @@ function MarketBarometer() {
   useEffect(() => {
     let cancelled = false
     const failureCounts = new Map<string, number>()
-    const MAX_ATTEMPTS_PER_SYMBOL = 5
+    const MAX_ATTEMPTS_PER_SYMBOL = 8
 
     const run = async () => {
       while (!cancelled) {
@@ -506,18 +524,13 @@ function MarketBarometer() {
           return
         }
 
-        try {
-          const bundle = await fetchMarketBundle({ symbols: missing }, mergeMarketBundle)
-          if (cancelled) {
-            return
-          }
-          for (const symbol of missing) {
-            if (!bundle.histories.has(symbol)) {
-              failureCounts.set(symbol, (failureCounts.get(symbol) ?? 0) + 1)
-            }
-          }
-        } catch {
-          for (const symbol of missing) {
+        const bundle = await fetchMissingSymbols(missing, mergeMarketBundle)
+        if (cancelled) {
+          return
+        }
+
+        for (const symbol of missing) {
+          if (!bundle.histories.has(symbol)) {
             failureCounts.set(symbol, (failureCounts.get(symbol) ?? 0) + 1)
           }
         }

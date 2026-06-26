@@ -162,6 +162,11 @@ export function collectFixedIncomeSymbols() {
   return [...new Set([...collectFredSymbols(), ...collectBondSymbols()])]
 }
 
+/** Developed-market ETFs that often land in late chunks on Netlify. */
+export function collectInternationalPrioritySymbols() {
+  return ['EWJ', 'EWU', 'EWG']
+}
+
 export const sectionDefinitions: SectionDefinition[] = [
   {
     title: 'U.S. equity benchmarks',
@@ -394,6 +399,7 @@ export const sectionDefinitions: SectionDefinition[] = [
       ['Solana', 'SOL-USD', 185, 1.8, 5.0],
       ['XRP', 'XRP-USD', 2.35, 1.6, 4.5],
       ['iShares Bitcoin Trust (IBIT)', 'IBIT', 58.0, 1.3, 3.2],
+      ['Harvest Bitcoin Spot ETF (3439.HK)', '3439.HK', 9.0, 1.3, 3.2],
     ]),
   },
 ]
